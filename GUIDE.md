@@ -321,7 +321,7 @@ app.post('/invocations', async (req: Request, res: Response) => {
 from google.adk.agents import Agent
 from google.adk.tools import google_search
 
-root_agent = Agent(
+agent = Agent(
     model="gemini-2.5-flash",
     tools=[google_search],
     instruction="I can answer questions by searching the internet."
@@ -421,11 +421,13 @@ The **Browser Tool** gives agents the ability to navigate websites, fill forms, 
 📁 **Code**: [`01-tutorials/05-AgentCore-tools/02-Agent-Core-browser-tool/`](./01-tutorials/05-AgentCore-tools/02-Agent-Core-browser-tool/)
 
 Features include:
-- Domain filtering (restrict which sites the agent can visit)
-- Proxy support for enterprise networks
-- Browser profiles and extensions
-- VPC integration for internal web apps
-- Live view for debugging agent browser sessions
+- **Domain filtering**: Restrict which sites the agent can visit (allowlist/blocklist)
+- **Proxy support**: Route browser traffic through enterprise proxies for network compliance
+- **Browser profiles and extensions**: Persist cookies/sessions and load Chrome extensions
+- **VPC integration**: Access internal web apps not exposed to the public internet
+- **Live view**: Watch the agent's browser session in real-time for debugging
+
+See the individual tutorials in the directory for configuration examples.
 
 ---
 
@@ -860,7 +862,7 @@ agentcore launch
 agentcore invoke '{"prompt": "tell me a joke"}'
 ```
 
-> **What `agentcore launch` does under the hood** [Hypothesis]: (1) Builds a Docker image from your agent code using a base image, (2) Pushes the image to ECR, (3) Creates an `AgentRuntime` resource via the Bedrock AgentCore API, (4) Configures IAM roles, networking, and environment variables. The runtime ID and ARN are stored locally for subsequent invocations.
+> **[Hypothesis]** Under the hood, `agentcore launch` likely: (1) Builds a Docker image from your agent code using a base image, (2) Pushes the image to ECR, (3) Creates an `AgentRuntime` resource via the Bedrock AgentCore API, (4) Configures IAM roles, networking, and environment variables. The runtime ID and ARN are stored locally for subsequent invocations.
 
 ### 10.2 CloudFormation
 
@@ -994,11 +996,13 @@ CMD ["node", "dist/index.js"]
 # Standard invocation pattern
 import boto3
 import json
+import os
 
-client = boto3.client("bedrock-agentcore", region_name="us-east-1")
+region = os.environ.get("AWS_REGION", "us-east-1")
+client = boto3.client("bedrock-agentcore", region_name=region)
 
 response = client.invoke_agent_runtime(
-    agentRuntimeArn="arn:aws:bedrock-agentcore:us-east-1:123456789:runtime/my-agent",
+    agentRuntimeArn="arn:aws:bedrock-agentcore:<region>:<account-id>:runtime/<agent-id>",
     qualifier="DEFAULT",
     payload=json.dumps({"prompt": "What's the weather in NYC?"})
 )
