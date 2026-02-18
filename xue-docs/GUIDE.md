@@ -400,34 +400,480 @@ agent = Agent(
 
 ### 3.3 Code Interpreter Tool
 
-AgentCore provides a **managed Code Interpreter** — a sandboxed Python execution environment that agents can use to write and run code.
+AgentCore provides a **managed Code Interpreter** — a sandboxed Python execution environment that agents can use to write and run code, read/write files, and run shell commands.
 
-> **[Hypothesis]** The Code Interpreter likely runs in an isolated container/microVM (similar to Lambda's Firecracker). The agent sends Python code to be executed, and receives stdout/stderr/file outputs back. This enables data analysis, chart generation, and complex computations without deploying custom tools.
+#### 3.3.1 SDK & Protocol
 
-📁 **Code**: [`01-tutorials/05-AgentCore-tools/01-Agent-Core-code-interpreter/`](./01-tutorials/05-AgentCore-tools/01-Agent-Core-code-interpreter/)
+The Code Interpreter is accessed via the **AWS REST API** using the `boto3` client for the `bedrock-agentcore` service. There is no MCP or gRPC involved at the transport layer — it's standard AWS API calls with SigV4-signed HTTP requests.
 
-Tutorials cover:
-- File operations (read/write files in the sandbox)
-- Code execution (run arbitrary Python)
-- Data analysis (pandas, matplotlib in the sandbox)
-- Command execution
+**Two levels of abstraction are available:**
+
+| Level | Package | Class/Function | Description |
+|-------|---------|---------------|-------------|
+| **High-level SDK** | `bedrock-agentcore` | `CodeInterpreter`, `code_session()` | Convenience wrapper with context manager |
+| **Low-level boto3** | `boto3` | `client("bedrock-agentcore")` | Direct AWS API calls |
+
+**High-level SDK usage** (from [`01-tutorials/05-AgentCore-tools/01-Agent-Core-code-interpreter/`](./01-tutorials/05-AgentCore-tools/01-Agent-Core-code-interpreter/)):
+```python
+from bedrock_agentcore.tools.code_interpreter_client import CodeInterpreter, code_session
+
+# Context manager pattern — auto-starts and auto-stops session
+with code_session("us-west-2") as code_client:
+    result = code_client.invoke("executeCode", {"code": "print(2+2)", "language": "python"})
+```
+
+**Low-level boto3 usage** (from [`03-integrations/agentic-frameworks/claude-agent/claude-with-code-interpreter/code_int_mcp/client.py`](./03-integrations/agentic-frameworks/claude-agent/claude-with-code-interpreter/code_int_mcp/client.py)):
+```python
+import boto3
+
+client = boto3.client("bedrock-agentcore", region_name="us-west-2")
+
+# Step 1: Start a session (creates the sandbox)
+session_response = client.start_code_interpreter_session(
+    codeInterpreterIdentifier="aws.codeinterpreter.v1",
+    name="mySession",
+    sessionTimeoutSeconds=900,  # 15-minute timeout
+)
+session_id = session_response["sessionId"]  # e.g., "01K00Z3F8WZ9KBBW4QGRJCVBHH"
+
+# Step 2: Invoke an operation (returns a streaming response)
+response = client.invoke_code_interpreter(
+    codeInterpreterIdentifier="aws.codeinterpreter.v1",
+    sessionId=session_id,
+    name="executeCode",  # Operation name
+    arguments={"code": "import pandas as pd; print(pd.__version__)", "language": "python"},
+)
+
+# Step 3: Read the streaming response
+for event in response["stream"]:
+    result = event["result"]
+    # result contains: output text, isError flag, structuredContent (stdout, stderr, exitCode)
+
+# Step 4: Stop the session (destroys the sandbox)
+client.stop_code_interpreter_session(
+    codeInterpreterIdentifier="aws.codeinterpreter.v1",
+    sessionId=session_id,
+)
+```
+
+#### 3.3.2 Authentication
+
+Authentication is **standard AWS IAM** — the same credential chain used by all AWS services:
+
+1. **No API keys or tokens** to manage for tool access. Your `boto3` client uses the ambient AWS credentials (environment variables, IAM role, `~/.aws/credentials`, or STS tokens).
+2. The `session_id` is **not an authentication token** — it's a sandbox identifier that isolates your execution environment.
+3. Required IAM permissions: `bedrock-agentcore:StartCodeInterpreterSession`, `bedrock-agentcore:InvokeCodeInterpreter`, `bedrock-agentcore:StopCodeInterpreterSession`.
+
+#### 3.3.3 Session & Sandbox Architecture
+
+```
+┌─────────────────┐     SigV4-signed HTTPS     ┌──────────────────────────┐
+│  Your Agent Code │ ──────────────────────────→ │ AgentCore API Endpoint   │
+│  (boto3 client)  │                             │ bedrock-agentcore service │
+└─────────────────┘                             └──────────┬───────────────┘
+                                                           │
+                                                           ▼
+                                                ┌──────────────────────┐
+                                                │   Sandbox (Session)  │
+                                                │  ┌────────────────┐  │
+                                                │  │ Python Runtime │  │
+                                                │  │ (pandas, numpy,│  │
+                                                │  │  matplotlib...) │  │
+                                                │  └────────────────┘  │
+                                                │  ┌────────────────┐  │
+                                                │  │  File System   │  │
+                                                │  │  (read/write)  │  │
+                                                │  └────────────────┘  │
+                                                │  ┌────────────────┐  │
+                                                │  │ Shell (bash)   │  │
+                                                │  └────────────────┘  │
+                                                └──────────────────────┘
+```
+
+> **[Hypothesis]** Each session likely runs in an isolated container/microVM (similar to AWS Lambda's Firecracker). The sandbox has a pre-installed Python environment with common data science libraries. The `clearContext=False` parameter allows variables/state to persist across multiple `invoke_code_interpreter` calls within the same session, suggesting the Python interpreter process stays alive between calls.
+
+**Key concepts:**
+- **`codeInterpreterIdentifier`**: Always `"aws.codeinterpreter.v1"` — identifies the managed service version.
+- **`sessionId`**: Returned by `start_code_interpreter_session()`. Identifies your isolated sandbox. Multiple agents can each have their own session.
+- **`sessionTimeoutSeconds`**: The sandbox auto-terminates after this period of inactivity (default ~15 min).
+- **`clearContext`**: When `False` (default), Python variables persist across calls within the same session. When `True`, each call starts fresh.
+
+#### 3.3.4 Available Operations
+
+Five operations are available via `invoke_code_interpreter`:
+
+| Operation | Arguments | What It Does |
+|-----------|-----------|-------------|
+| `executeCode` | `{"code": str, "language": "python", "clearContext": bool}` | Execute Python code, return stdout/stderr |
+| `executeCommand` | `{"command": str}` | Run a shell command (e.g., `ls`, `pip install`) |
+| `writeFiles` | `{"content": [{"path": str, "text": str}]}` | Write files to the sandbox filesystem |
+| `readFiles` | `{"paths": [str]}` | Read file contents from the sandbox |
+| `listFiles` | `{"path": str}` | List directory contents |
+
+**Response structure** (from streaming events):
+```json
+{
+  "sessionId": "01K00Z3F8WZ9KBBW4QGRJCVBHH",
+  "id": "...",
+  "isError": false,
+  "content": [{"type": "text", "text": "4\n"}],
+  "structuredContent": {
+    "stdout": "4\n",
+    "stderr": "",
+    "exitCode": 0,
+    "executionTime": 0.71
+  }
+}
+```
+
+#### 3.3.5 Wrapping Code Interpreter as an MCP Server
+
+The repo includes an example of wrapping the Code Interpreter boto3 client as an **MCP server** for use with the Claude SDK. This shows how the REST API can be bridged to any protocol:
+
+```python
+# 03-integrations/agentic-frameworks/claude-agent/claude-with-code-interpreter/code_int_mcp/server.py
+from .client import CodeInterpreterClient
+from claude_agent_sdk import tool, create_sdk_mcp_server
+
+client = CodeInterpreterClient()  # boto3 wrapper
+
+@tool("execute_code", "Execute code using Code Interpreter.",
+      {"code": str, "language": str, "code_int_session_id": str})
+async def execute_code(args):
+    result = client.execute_code(args["code"], args.get("language", "python"))
+    return {"content": [{"type": "text", "text": result.model_dump_json()}]}
+
+# ... similar wrappers for execute_command, write_files, read_files
+
+code_int_mcp_server = create_sdk_mcp_server(
+    name="codeinterpretertools", version="1.0.0",
+    tools=[execute_code, execute_command, write_files, read_files],
+)
+```
+
+This pattern lets you use the Code Interpreter with **any framework that supports MCP** — even though the underlying transport is AWS REST API.
+
+📁 **Code**: [`01-tutorials/05-AgentCore-tools/01-Agent-Core-code-interpreter/`](./01-tutorials/05-AgentCore-tools/01-Agent-Core-code-interpreter/), [`03-integrations/agentic-frameworks/claude-agent/claude-with-code-interpreter/`](./03-integrations/agentic-frameworks/claude-agent/claude-with-code-interpreter/)
+
+---
 
 ### 3.4 Browser Tool
 
-The **Browser Tool** gives agents the ability to navigate websites, fill forms, and extract information — like a programmatic web browser.
+The **Browser Tool** gives agents the ability to navigate websites, fill forms, click elements, and extract information — using a **real managed Chromium browser** running in the AWS cloud.
 
-> **[Hypothesis]** The Browser Tool likely runs a headless Chromium instance in a managed environment (possibly based on [BrowserUse](https://github.com/browser-use/browser-use) or [NovaAct](https://nova.amazon.com/act)). The agent sends navigation instructions (go to URL, click element, fill form) and receives page content back.
+#### 3.4.1 SDK & Protocol
 
-📁 **Code**: [`01-tutorials/05-AgentCore-tools/02-Agent-Core-browser-tool/`](./01-tutorials/05-AgentCore-tools/02-Agent-Core-browser-tool/)
+The Browser Tool uses a **two-protocol architecture**:
 
-Features include:
-- **Domain filtering**: Restrict which sites the agent can visit (allowlist/blocklist)
-- **Proxy support**: Route browser traffic through enterprise proxies for network compliance
-- **Browser profiles and extensions**: Persist cookies/sessions and load Chrome extensions
-- **VPC integration**: Access internal web apps not exposed to the public internet
-- **Live view**: Watch the agent's browser session in real-time for debugging
+| Phase | Protocol | Authentication | Purpose |
+|-------|----------|---------------|---------|
+| **Control plane** | AWS REST API (boto3) | IAM SigV4 | Create/delete browsers, start/stop sessions |
+| **Data plane** | **WebSocket (WSS)** with **Chrome DevTools Protocol (CDP)** | SigV4-signed headers | Actually control the browser (navigate, click, extract) |
 
-See the individual tutorials in the directory for configuration examples.
+This is fundamentally different from the Code Interpreter. The Code Interpreter uses REST for everything; the Browser Tool uses REST to set up the session, then **upgrades to a WebSocket connection** that speaks CDP — the same protocol Chrome DevTools uses internally.
+
+**SDK packages:**
+
+| Package | Purpose |
+|---------|---------|
+| `bedrock-agentcore` | `BrowserClient` class for session lifecycle + WebSocket URL generation |
+| `boto3` | Low-level `bedrock-agentcore` and `bedrock-agentcore-control` clients |
+| `playwright` | CDP client for browser automation (Microsoft's Playwright library) |
+| Optional: `nova-act` | Amazon's LLM-powered browser agent (uses CDP under the hood) |
+| Optional: `browser-use` | Open-source LLM browser agent (uses CDP under the hood) |
+| Optional: `strands-agents-tools` | Strands framework browser wrapper |
+
+#### 3.4.2 Session Lifecycle (Detailed)
+
+The browser session has **three distinct phases**: Create → Connect → Destroy.
+
+**Phase 1: Create browser + start session (REST API)**
+
+```python
+# Low-level boto3 pattern
+# From: 01-tutorials/05-AgentCore-tools/02-Agent-Core-browser-tool/09-browser-with-domain-filtering/verify_domain_filtering.py
+
+import boto3
+
+client = boto3.client("bedrock-agentcore")
+
+# Start a session on an existing browser resource
+response = client.start_browser_session(browserIdentifier=BROWSER_ID)
+session_id = response["sessionId"]
+```
+
+Or using the higher-level SDK:
+
+```python
+# High-level SDK pattern
+# From: 02-use-cases/market-trends-agent/tools/browser_tool.py
+
+from bedrock_agentcore.tools.browser_client import browser_session
+
+with browser_session("us-east-1") as client:
+    ws_url, headers = client.generate_ws_headers()
+    # ... use ws_url and headers with Playwright
+```
+
+For advanced use cases (recording, custom network config), use the control plane:
+
+```python
+# Control plane: create browser with recording
+# From: 02-use-cases/enterprise-web-intelligence-agent/strands/browser_tools.py
+
+from bedrock_agentcore._utils.endpoints import get_control_plane_endpoint
+
+control_plane_url = get_control_plane_endpoint(region)
+control_client = boto3.client("bedrock-agentcore-control",
+    region_name=region, endpoint_url=control_plane_url)
+
+response = control_client.create_browser(
+    name="my_browser",
+    executionRoleArn=role_arn,
+    networkConfiguration={"networkMode": "PUBLIC"},
+    recording={
+        "enabled": True,
+        "s3Location": {"bucket": "my-bucket", "prefix": "recordings/"}
+    }
+)
+browser_id = response["browserId"]
+```
+
+**Phase 2: Connect via WebSocket + CDP**
+
+This is the key part. The agent code connects to a **SigV4-signed WebSocket URL** that tunnels Chrome DevTools Protocol:
+
+```python
+# From: 01-tutorials/05-AgentCore-tools/02-Agent-Core-browser-tool/helpers/browser_helper.py
+
+from botocore.auth import SigV4Auth
+from botocore.awsrequest import AWSRequest
+from urllib.parse import urlparse
+
+# The WebSocket URL format
+ws_url = f"wss://bedrock-agentcore.{REGION}.amazonaws.com/browser-streams/{browser_id}/sessions/{session_id}/automation"
+
+# SigV4 signing: same technique as signing any AWS API request
+def get_signed_headers(ws_url):
+    credentials = boto3.Session().get_credentials()
+    https_url = ws_url.replace("wss://", "https://")
+    parsed = urlparse(https_url)
+
+    request = AWSRequest(method="GET", url=https_url, headers={"host": parsed.netloc})
+    SigV4Auth(credentials, "bedrock-agentcore", REGION).add_auth(request)
+    return {k: v for k, v in request.headers.items()}
+
+headers = get_signed_headers(ws_url)
+
+# Now connect Playwright to the remote browser via CDP
+from playwright.async_api import async_playwright
+
+async with async_playwright() as p:
+    browser = await p.chromium.connect_over_cdp(ws_url, headers=headers)
+    page = browser.contexts[0].pages[0]
+
+    # From here, it's standard Playwright API
+    await page.goto("https://example.com")
+    content = await page.inner_text("body")
+    await page.click("button#submit")
+    await page.fill("input#search", "query")
+```
+
+**Phase 3: Stop session (REST API)**
+
+```python
+# From: 01-tutorials/05-AgentCore-tools/02-Agent-Core-browser-tool/09-browser-with-domain-filtering/verify_domain_filtering.py
+
+client.stop_browser_session(browserIdentifier=BROWSER_ID, sessionId=session_id)
+```
+
+#### 3.4.3 Authentication Deep Dive
+
+The Browser Tool's auth is more nuanced than the Code Interpreter because of the WebSocket upgrade:
+
+```
+┌──────────────┐   (1) SigV4 REST   ┌──────────────────────┐
+│ Agent Code   │ ──────────────────→ │ AgentCore Control    │
+│              │  start_browser_     │ Plane (REST API)     │
+│              │  session()          │                      │
+│              │ ←────────────────── │ Returns: sessionId   │
+│              │                     └──────────────────────┘
+│              │
+│              │   (2) SigV4 WSS     ┌──────────────────────┐
+│ (Playwright) │ ──────────────────→ │ AgentCore Browser    │
+│              │  connect_over_cdp   │ Stream (WebSocket)   │
+│              │  w/ signed headers  │                      │
+│              │ ←──────────────────→│ Chromium (via CDP)   │
+│              │  bidirectional CDP  │                      │
+└──────────────┘                     └──────────────────────┘
+```
+
+1. **Control plane calls** (start/stop session) use standard boto3 SigV4 signing — automatic.
+2. **WebSocket connection** requires **manual SigV4 signing** of the WebSocket URL. You must:
+   - Convert `wss://` to `https://` for signing purposes
+   - Create an `AWSRequest` with the URL
+   - Sign it with `SigV4Auth(credentials, "bedrock-agentcore", region)`
+   - Extract the signed headers (`Authorization`, `X-Amz-Date`, `X-Amz-Security-Token`)
+   - Pass these headers to `playwright.chromium.connect_over_cdp(ws_url, headers=headers)`
+3. The `bedrock-agentcore` SDK's `BrowserClient.generate_ws_headers()` encapsulates this — it returns the signed `(ws_url, headers)` tuple.
+
+> **Why WebSocket and not REST?** CDP (Chrome DevTools Protocol) is inherently bidirectional — the browser sends events (page loaded, network request completed, console message) back to the client. REST wouldn't work for this. The WebSocket connection is a tunnel for the full CDP protocol, giving your Playwright code direct control over the remote Chromium instance as if it were running locally.
+
+#### 3.4.4 Integration Patterns
+
+The repo shows **four ways** to use the Browser Tool, from lowest to highest abstraction:
+
+**Pattern A: Raw Playwright + CDP** (most control)
+
+```python
+# From: 01-tutorials/05-AgentCore-tools/02-Agent-Core-browser-tool/09-browser-with-domain-filtering/verify_domain_filtering.py
+
+async with async_playwright() as p:
+    browser = await p.chromium.connect_over_cdp(ws_url, headers=signed_headers)
+    page = browser.contexts[0].pages[0]
+    await page.goto("https://example.com")
+    content = await page.inner_text("body")
+```
+
+**Pattern B: Nova Act** (LLM-driven browser agent by Amazon)
+
+```python
+# From: 01-tutorials/05-AgentCore-tools/02-Agent-Core-browser-tool/01-browser-with-NovaAct/
+
+from bedrock_agentcore.tools.browser_client import browser_session
+from nova_act import NovaAct
+
+with browser_session(region) as client:
+    ws_url, headers = client.generate_ws_headers()
+    with NovaAct(
+        cdp_endpoint_url=ws_url,
+        cdp_headers=headers,
+        nova_act_api_key=key,
+        starting_page="https://example.com"
+    ) as nova:
+        result = nova.act("Find the price of the first product")  # Natural language!
+```
+
+**Pattern C: Browser-Use** (open-source LLM browser agent)
+
+```python
+# From: 01-tutorials/05-AgentCore-tools/02-Agent-Core-browser-tool/02-browser-with-browserUse/
+
+from bedrock_agentcore.tools.browser_client import BrowserClient
+from browser_use import Agent, Browser, BrowserProfile
+
+client = BrowserClient(region)
+client.start()
+ws_url, headers = client.generate_ws_headers()
+
+profile = BrowserProfile(headers=headers, timeout=1500000)
+browser_session = Browser(cdp_url=ws_url, browser_profile=profile, keep_alive=True)
+
+agent = Agent(task="Search for AI news", llm=ChatAnthropicBedrock(...), browser_session=browser_session)
+await agent.run()
+```
+
+**Pattern D: Strands browser tool** (highest abstraction)
+
+```python
+# From: 01-tutorials/05-AgentCore-tools/02-Agent-Core-browser-tool/04-browser-with-Strands/
+
+from strands_tools.browser import AgentCoreBrowser
+from strands import Agent
+
+browser = AgentCoreBrowser(region="us-west-2")
+agent = Agent(
+    tools=[browser.browser],  # Browser exposed as a Strands tool
+    model="global.anthropic.claude-haiku-4-5-20251001-v1:0"
+)
+result = agent("Visit example.com and tell me what you see")
+```
+
+#### 3.4.5 Advanced Features
+
+**Live View (DCV streaming)**
+
+AgentCore can stream the browser's visual output in real-time using **AWS DCV (NICE DCV)** protocol:
+
+```python
+# From: 01-tutorials/05-AgentCore-tools/02-Agent-Core-browser-tool/05-browser-live-view/
+
+live_view_url = browser_client.generate_live_view_url(expires=300)
+# Returns a presigned URL that opens a DCV viewer in a web browser
+# Uses DCVjs JavaScript SDK on the frontend
+```
+
+This enables a **human-in-the-loop** pattern: a human can watch the agent browse and take over control.
+
+**Domain Filtering (Network Firewall)**
+
+Domain filtering is implemented at the **network level** using AWS Network Firewall, not in the browser itself:
+
+```python
+# From: 01-tutorials/05-AgentCore-tools/02-Agent-Core-browser-tool/09-browser-with-domain-filtering/
+
+# The browser runs inside a VPC with a Network Firewall
+# CloudFormation defines allowed/denied domains:
+#   AllowedDomains: .example.com, .github.com, .wikipedia.org
+#   DeniedDomains: .facebook.com, .twitter.com
+# All unlisted domains are blocked by default (default-deny)
+
+# The agent code doesn't need to do anything special —
+# the firewall transparently blocks/allows requests:
+await page.goto("https://example.com")     # ✅ Allowed
+await page.goto("https://facebook.com")    # ❌ Timeout/blocked by firewall
+await page.goto("https://randomsite.com")  # ❌ Blocked (default deny)
+```
+
+**Web Bot Auth Signing**
+
+For enterprise use cases where the browser needs to authenticate with internal services:
+
+```python
+# From: 01-tutorials/05-AgentCore-tools/02-Agent-Core-browser-tool/06-Web-Bot-Auth-Signing/
+
+# Browser created with signing enabled — all outgoing HTTP requests
+# get cryptographic signatures automatically:
+response = control_client.create_browser(
+    name="signed_browser",
+    browserSigning={"enabled": True}  # Automatic request signing
+)
+# Signed headers: Signature-Input, Signature-Agent, Signature
+```
+
+#### 3.4.6 Communication Architecture Summary
+
+```
+┌───────────────────────────────────────────────────────────────┐
+│                     YOUR AGENT CODE                            │
+│                                                                │
+│  ┌──────────────┐  ┌──────────────┐  ┌────────────────────┐  │
+│  │ boto3 client  │  │ BrowserClient│  │ Playwright/Nova/   │  │
+│  │ (control)     │  │ (SDK wrapper)│  │ BrowserUse/Strands │  │
+│  └──────┬───────┘  └──────┬───────┘  └─────────┬──────────┘  │
+│         │                  │                     │             │
+└─────────┼──────────────────┼─────────────────────┼─────────────┘
+          │                  │                     │
+          │ (REST/SigV4)     │ (REST/SigV4)        │ (WSS/SigV4 + CDP)
+          ▼                  ▼                     ▼
+┌─────────────────┐  ┌──────────────┐  ┌────────────────────────┐
+│ Control Plane   │  │ Session Mgmt │  │ Browser Stream         │
+│ create_browser  │  │ start/stop   │  │ (WebSocket endpoint)   │
+│ delete_browser  │  │ session      │  │                        │
+└─────────────────┘  └──────────────┘  │  ┌──────────────────┐  │
+                                       │  │  Chromium (CDP)   │  │
+                                       │  │  ┌─────────────┐  │  │
+                                       │  │  │ Page/Tab    │  │  │
+                                       │  │  │ Navigation  │  │  │
+                                       │  │  │ DOM access  │  │  │
+                                       │  │  │ Network     │  │  │
+                                       │  │  │ Screenshots │  │  │
+                                       │  │  └─────────────┘  │  │
+                                       │  └──────────────────┘  │
+                                       └────────────────────────┘
+```
+
+📁 **Code**: [`01-tutorials/05-AgentCore-tools/02-Agent-Core-browser-tool/`](./01-tutorials/05-AgentCore-tools/02-Agent-Core-browser-tool/), [`02-use-cases/market-trends-agent/tools/browser_tool.py`](./02-use-cases/market-trends-agent/tools/browser_tool.py), [`02-use-cases/enterprise-web-intelligence-agent/strands/browser_tools.py`](./02-use-cases/enterprise-web-intelligence-agent/strands/browser_tools.py)
 
 ---
 
