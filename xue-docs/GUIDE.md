@@ -879,50 +879,101 @@ response = control_client.create_browser(
 
 ## 4. Agent Memory: Short-Term, Long-Term, and Memory Types
 
-AgentCore Memory provides **managed memory infrastructure** so agents can remember context across turns and sessions.
+AgentCore Memory provides **managed memory infrastructure** so agents can remember context across turns and sessions. It has a **two-tier architecture**: raw conversation events (short-term) are automatically processed by an extraction pipeline that produces indexed memory records (long-term).
 
-### 4.1 Architecture
+### 4.1 SDK & Protocol
 
-> **[Hypothesis]** AgentCore Memory likely uses a combination of:
-> - **DynamoDB** or similar for event/conversation storage (fast writes, ordered reads)
-> - **Vector database** (possibly Amazon OpenSearch or a custom embedding store) for semantic retrieval
-> - A **background extraction pipeline** that processes conversation events, extracts facts/preferences/episodes using an LLM, and stores them as embeddings
+Memory uses the same pattern as other AgentCore services: **REST API via boto3** with standard IAM SigV4 authentication. There are two client layers:
 
-### 4.2 Memory Types
-
-AgentCore supports three **memory strategies**, configured when you create a memory resource:
-
-#### Semantic Memory ("What is true?")
-Stores **factual information** extracted from conversations as vector embeddings for similarity search.
+| Level | Package | Class | Purpose |
+|-------|---------|-------|---------|
+| **High-level SDK** | `bedrock-agentcore` | `MemoryClient` | Convenience wrapper with helper methods |
+| **Low-level boto3** | `boto3` | `client("bedrock-agentcore")` + `client("bedrock-agentcore-control")` | Direct AWS API calls |
 
 ```python
-# Creating memory with semantic strategy
-# 02-use-cases/market-trends-agent/deploy.py
-strategies = [
-    {
-        "SEMANTIC": {
-            "name": "MarketTrendsSemantic",
-            "description": "Stores financial facts, market analysis, investment insights",
-            "namespaces": ["market-trends/broker/{actorId}/semantic"],
-        }
-    },
-]
+# High-level SDK
+from bedrock_agentcore.memory import MemoryClient
+memory_client = MemoryClient(region_name="us-east-1")
 
-memory = memory_client.create_memory_and_wait(
-    name="market-trends-memory",
-    description="Market Trends Agent memory",
-    strategies=strategies,
-    event_expiry_days=90,
-)
+# Low-level boto3 (two clients: data plane + control plane)
+import boto3
+data_client = boto3.client("bedrock-agentcore", region_name="us-east-1")      # events, retrieval
+control_client = boto3.client("bedrock-agentcore-control", region_name="us-east-1")  # create/delete memory
 ```
 
-#### User Preference Memory ("What does the user like?")
-Captures **user-specific preferences** and settings — automatically extracted from conversations.
+### 4.2 Core Concepts: Events vs. Memories
+
+This is the most important distinction in the memory system:
+
+| Aspect | **Events** (Short-Term) | **Memories** (Long-Term) |
+|--------|------------------------|-------------------------|
+| **What they store** | Raw conversation turns (user said X, agent said Y) | Extracted knowledge (facts, preferences, episodes) |
+| **API to write** | `create_event()` | `batch_create_memory_records()` (automatic via pipeline) |
+| **API to read** | `list_events()`, `get_last_k_turns()` | `retrieve_memories()` (semantic search) |
+| **Expiry** | Configurable (`event_expiry_days`) | Indefinite |
+| **Index type** | Sequential (chronological) | Vector embeddings (semantic similarity) |
+| **Who writes** | Your agent code | Background extraction pipeline (automatic) |
+
+**The flow**: Your agent saves **events** (raw conversations) → AgentCore's background pipeline **extracts** facts/preferences/episodes → These become **memories** (indexed, searchable long-term knowledge).
 
 ```python
-# User preference strategy
+# Events: Raw conversation storage
+memory_client.create_event(
+    memory_id=memory_id,
+    actor_id="user123",
+    session_id="session456",
+    messages=[
+        ("What's the weather in NYC?", "USER"),
+        ("It's currently 72°F and partly cloudy in New York City.", "ASSISTANT"),
+    ]
+)
+
+# Memories: Extracted knowledge (retrieved via semantic search)
+results = memory_client.retrieve_memories(
+    memory_id=memory_id,
+    namespace="weather/user/user123/preferences",
+    query="user location preferences",
+    top_k=5
+)
+# → Returns: "User frequently asks about NYC weather" (extracted by pipeline)
+```
+
+### 4.3 Memory Strategies (Types)
+
+When you create a memory resource, you configure one or more **strategies** that control how the extraction pipeline processes events into memories.
+
+#### 4.3.1 Semantic Strategy ("What facts are true?")
+
+Extracts **individual facts** from conversations and stores them as vector embeddings for similarity search.
+
+```python
+# From: 02-use-cases/SRE-agent/sre_agent/memory/client.py
+from bedrock_agentcore.memory.constants import StrategyType
+
 {
-    "USER_PREFERENCE": {
+    StrategyType.SEMANTIC.value: {
+        "name": "infrastructure_knowledge",
+        "description": "Infrastructure dependencies, performance patterns, configurations",
+        "namespaces": ["/sre/infrastructure/{actorId}/{sessionId}"]
+    }
+}
+```
+
+> **[Hypothesis — Underlying Technology]**: Semantic memory likely uses a **vector database** (possibly Amazon OpenSearch Serverless with vector engine, or a custom FAISS/HNSW index) behind the scenes. When the extraction pipeline produces a fact like "Database cluster has 3 replicas in us-east-1", this text is:
+> 1. Embedded using a text embedding model (likely Amazon Titan Embeddings or Cohere Embed)
+> 2. Stored as a vector in the index along with the text content and metadata
+> 3. Retrieved via approximate nearest neighbor (ANN) search when `retrieve_memories()` is called with a query
+>
+> The `namespace` acts as a **partition key** / filter on the vector index — only vectors in the matching namespace are searched. This is why cross-session queries work (omit `{sessionId}` to search across all sessions).
+
+#### 4.3.2 User Preference Strategy ("What does the user want?")
+
+Extracts and **consolidates** user preferences — automatically deduplicating and updating as preferences change.
+
+```python
+# From: 02-use-cases/market-trends-agent/deploy.py
+{
+    StrategyType.USER_PREFERENCE.value: {
         "name": "BrokerPreferences",
         "description": "Captures broker preferences, risk tolerance, investment styles",
         "namespaces": ["market-trends/broker/{actorId}/preferences"],
@@ -930,97 +981,563 @@ Captures **user-specific preferences** and settings — automatically extracted 
 }
 ```
 
-#### Episodic Memory ("What happened?")
-Stores **complete interaction episodes** with full temporal context (situation → intent → assessment → outcome).
+> **[Hypothesis — Underlying Technology]**: User preference memory likely uses a **structured key-value store** (possibly DynamoDB) in addition to vector embeddings. Preferences have a natural key-value structure ("preferred_cuisine": "Italian", "risk_tolerance": "high"). The consolidation step likely:
+> 1. Retrieves existing preferences for the user
+> 2. Uses an LLM to merge new preferences with existing ones (resolving conflicts — e.g., "user now prefers Mediterranean over Italian")
+> 3. Overwrites the old preference record
+>
+> This is why user preference namespaces typically **don't include `{sessionId}`** — preferences are user-global, not session-scoped.
 
-The key difference: episodic memory captures the **narrative arc** of an interaction, not just individual facts.
+#### 4.3.3 Summary Strategy ("What's the overview?")
 
-📁 **Code**: [`01-tutorials/04-AgentCore-memory/02-long-term-memory/01-single-agent/using-langgraph-agent-hooks/episodic-memory/`](./01-tutorials/04-AgentCore-memory/02-long-term-memory/01-single-agent/using-langgraph-agent-hooks/episodic-memory/)
-
-### 4.3 Short-Term Memory (Within a Session)
-
-Short-term memory maintains conversation context within a single session:
+Produces **condensed summaries** of conversations, useful for long-running investigations or multi-session projects.
 
 ```python
-# 02-use-cases/AWS-operations-agent/agentcore-runtime/src/utils/memory_manager.py
-def store_conversation_turn(self, user_message: str, assistant_response: str, actor_id: str):
-    messages = [
-        (user_message, "USER"),
-        (assistant_response, "ASSISTANT")
-    ]
-    self.memory_client.create_event(
-        memory_id=self.memory_id,
-        actor_id=actor_id,
-        session_id=self.session_id,
-        messages=messages
-    )
-
-def get_conversation_context(self, actor_id: str, max_results: int = 10):
-    return self.memory_client.list_events(
-        memory_id=self.memory_id,
-        actor_id=actor_id,
-        session_id=self.session_id,
-        max_results=max_results
-    )
+# From: 02-use-cases/SRE-agent/sre_agent/memory/client.py
+{
+    StrategyType.SUMMARY.value: {
+        "name": "investigation_summaries",
+        "description": "Investigation summaries with findings, timelines, and resolutions",
+        "namespaces": ["/sre/investigations/{actorId}/{sessionId}"]
+    }
+}
 ```
 
-### 4.4 Long-Term Memory (Across Sessions)
+> **[Hypothesis — Underlying Technology]**: Summary memory likely uses a **document store** (DynamoDB or S3) rather than pure vector search. Summaries are typically retrieved by session/actor, not by semantic similarity. The extraction step uses an LLM to produce a structured summary (key findings, timeline, resolution status) from the raw conversation. Consolidation merges summaries from the same investigation across turns.
 
-Long-term memory persists across sessions using **memory hooks** — lifecycle callbacks that automatically save and retrieve memories:
+#### 4.3.4 Custom Strategy (Full Control)
+
+For advanced use cases, you can provide **custom extraction and consolidation prompts** and even run your own extraction pipeline via Lambda + SNS:
 
 ```python
-# 02-use-cases/customer-support-assistant/agent_config/memory_hook_provider.py
+# From: 02-use-cases/slide-deck-generator-memory-agent/memory_setup.py
+from bedrock_agentcore_starter_toolkit.operations.memory.models.strategies import (
+    CustomUserPreferenceStrategy, ExtractionConfig, ConsolidationConfig,
+)
+
+strategy = CustomUserPreferenceStrategy(
+    name="SlideStylePreferences",
+    description="User slide styling preferences",
+    extraction_config=ExtractionConfig(
+        append_to_prompt="""Extract user preferences for:
+        - Color schemes (blue, green, purple)
+        - Font families (modern, classic, technical)
+        - Visual preferences (gradients, shadows, spacing)
+        Focus on explicit preferences and patterns.""",
+        model_id="global.anthropic.claude-sonnet-4-5-20250929-v1:0",
+    ),
+    consolidation_config=ConsolidationConfig(
+        append_to_prompt="""Consolidate into comprehensive preference profile.
+        Create clear patterns for future generation.""",
+        model_id="global.anthropic.claude-sonnet-4-5-20250929-v1:0",
+    ),
+    namespaces=["slidedecks/user/{actorId}/style_preferences"],
+)
+```
+
+**Self-managed strategy** (Lambda-based pipeline):
+
+```python
+# From: 01-tutorials/04-AgentCore-memory/02-long-term-memory/01-single-agent/
+# using-strands-agent-hooks/culinary-assistant-self-managed-strategy/
+
+# boto3 control plane API
+response = control_client.create_memory(
+    name="my_memory",
+    memoryExecutionRoleArn=role_arn,
+    eventExpiryDuration=7,
+    memoryStrategies=[{
+        "customMemoryStrategy": {
+            "name": "custom_extractor",
+            "description": "Custom extraction logic",
+            "configuration": {
+                "selfManagedConfiguration": {
+                    "triggerConditions": [
+                        {"messageBasedTrigger": {"messageCount": 5}},    # After 5 messages
+                        {"tokenBasedTrigger": {"tokenCount": 1000}},     # After 1000 tokens
+                        {"timeBasedTrigger": {"idleSessionTimeout": 900}} # After 15 min idle
+                    ],
+                    "invocationConfiguration": {
+                        "topicArn": sns_topic_arn,           # SNS notifies your Lambda
+                        "payloadDeliveryBucketName": s3_bucket, # Raw events delivered via S3
+                    },
+                    "historicalContextWindowSize": 10,
+                }
+            },
+        }
+    }],
+)
+```
+
+### 4.4 The Extraction Pipeline (How Events Become Memories)
+
+This is the most technically interesting part of AgentCore Memory. When you save events, a **background pipeline** automatically extracts structured knowledge.
+
+#### 4.4.1 Managed Pipeline (Built-in Strategies)
+
+For semantic, user_preference, and summary strategies, AgentCore runs the extraction automatically:
+
+```
+┌──────────────┐     create_event()     ┌───────────────────┐
+│ Agent Code   │ ──────────────────────→│ Event Store       │
+│              │                         │ (Short-Term)      │
+└──────────────┘                         └───────┬───────────┘
+                                                 │
+                                    Trigger: message count / token count / idle timeout
+                                                 │
+                                                 ▼
+                                    ┌────────────────────────┐
+                                    │  Extraction Pipeline   │
+                                    │  (Managed by AgentCore)│
+                                    │                        │
+                                    │  1. Read raw events    │
+                                    │  2. Build prompt       │
+                                    │  3. Call Bedrock LLM   │
+                                    │  4. Parse JSON output  │
+                                    │  5. Embed text         │
+                                    │  6. Store in vector DB │
+                                    └────────────────────────┘
+                                                 │
+                                                 ▼
+                                    ┌────────────────────────┐
+                                    │  Memory Store          │
+                                    │  (Long-Term, Indexed)  │
+                                    │  ┌──────────────────┐  │
+                                    │  │ Vector Index     │  │
+                                    │  │ (namespace-scoped│  │
+                                    │  │  embeddings)     │  │
+                                    │  └──────────────────┘  │
+                                    └────────────────────────┘
+                                                 │
+                                    retrieve_memories(query)
+                                                 │
+                                                 ▼
+                                    ┌──────────────┐
+                                    │ Agent Code   │
+                                    │ (Semantic    │
+                                    │  search)     │
+                                    └──────────────┘
+```
+
+#### 4.4.2 Self-Managed Pipeline (Custom Lambda)
+
+For full control, you can run your own extraction logic:
+
+```python
+# Lambda function triggered by SNS → SQS
+# From: 01-tutorials/04-AgentCore-memory/.../lambda_function.py
+
+class MemoryExtractor:
+    """Stage 1: Extract knowledge from conversation using Bedrock"""
+
+    def extract_memories(self, payload):
+        conversation_text = self._build_conversation_text(payload)
+
+        prompt = """Extract user preferences, interests, and facts from this conversation.
+Return ONLY a valid JSON array with this format:
+[{"content": "detailed description", "type": "preference|interest|fact", "confidence": 0.0-1.0}]"""
+
+        response = self.bedrock_client.invoke_model(
+            modelId="global.anthropic.claude-haiku-4-5-20251001-v1:0",
+            body=json.dumps({
+                "anthropic_version": "bedrock-2023-05-31",
+                "max_tokens": 1000,
+                "messages": [{"role": "user", "content": prompt}]
+            })
+        )
+        return json.loads(response_body["content"][0]["text"])
+
+
+class MemoryIngestor:
+    """Stage 2: Persist extracted knowledge to AgentCore"""
+
+    def batch_ingest_memories(self, memory_id, records, strategy_id):
+        batch_records = [{
+            "requestIdentifier": str(uuid.uuid4()),
+            "content": {"text": record["content"]},
+            "namespaces": [f"/interests/actor/{actor_id}/session/{session_id}/"],
+            "memoryStrategyId": strategy_id,
+            "timestamp": datetime.fromtimestamp(ts_value),
+        } for record in records]
+
+        self.agentcore_client.batch_create_memory_records(
+            memoryId=memory_id,
+            records=batch_records,
+            clientToken=str(uuid.uuid4())
+        )
+```
+
+**Pipeline flow for self-managed**:
+```
+Events → Trigger → SNS → SQS → Lambda → S3 (raw payload) → Bedrock (extraction) → batch_create_memory_records
+```
+
+> **[Hypothesis — Underlying Technology]**: The managed extraction pipeline likely runs the same architecture internally — an event-driven pipeline (EventBridge or SNS → Lambda or Step Functions) that reads events from the event store, calls Bedrock for extraction, embeds the results, and writes to the vector index. The trigger conditions (message count, token count, idle timeout) are likely implemented as **CloudWatch alarms** or **DynamoDB Streams triggers** on the event store.
+
+### 4.5 Namespaces: Scoping Memory Access
+
+Namespaces are **hierarchical paths** (like S3 prefixes) that scope memory storage and retrieval. They support **variable substitution** with `{actorId}` and `{sessionId}`.
+
+```python
+# USER-SCOPED (no session — persists across all sessions):
+"/sre/users/{actorId}/preferences"              # User preferences
+"support/user/{actorId}/facts"                  # Factual knowledge about user
+"slidedecks/user/{actorId}/style_preferences"   # Slide style prefs
+
+# SESSION-SCOPED (includes session — isolated per session):
+"/sre/infrastructure/{actorId}/{sessionId}"     # Infrastructure knowledge
+"/sre/investigations/{actorId}/{sessionId}"     # Investigation summaries
+"market-trends/broker/{actorId}/semantic"       # Market analysis per broker
+
+# CROSS-SESSION SEARCH (query without session for broader search):
+memories = client.retrieve_memories(
+    memory_id=memory_id,
+    namespace="/sre/infrastructure/user123",     # No session → searches ALL sessions
+    query="database connection issues",
+    top_k=5
+)
+```
+
+> **[Hypothesis — Underlying Technology]**: Namespaces are likely implemented as **metadata filters** on the vector index. When you call `retrieve_memories(namespace="/sre/infrastructure/user123")`, the system:
+> 1. Embeds the query text into a vector
+> 2. Performs ANN (Approximate Nearest Neighbor) search **filtered to records whose namespace starts with the given prefix**
+> 3. Returns top-k results ranked by cosine similarity
+>
+> This is why omitting `{sessionId}` gives you cross-session search — the prefix filter `/sre/infrastructure/user123` matches all session-specific namespaces like `/sre/infrastructure/user123/session456`.
+
+### 4.6 Memory Hooks: Automatic Save & Retrieve
+
+**Memory hooks** are lifecycle callbacks that automatically handle memory I/O during agent execution. They are the key to making memory "just work" without manual API calls in your agent logic.
+
+```python
+# From: 02-use-cases/A2A-multi-agent-incident-response/monitoring_strands_agent/memory_hook.py
+from strands.hooks import HookProvider, HookRegistry, MessageAddedEvent, AgentInitializedEvent
+
 class MemoryHook(HookProvider):
+
+    def __init__(self, memory_client, memory_id, actor_id, session_id):
+        self.memory_client = memory_client
+        self.memory_id = memory_id
+        self.actor_id = actor_id
+        self.session_id = session_id
+
     def on_agent_initialized(self, event: AgentInitializedEvent):
-        """Load conversation history when agent starts."""
+        """Called when agent starts — loads conversation history into context."""
         recent_turns = self.memory_client.get_last_k_turns(
             memory_id=self.memory_id,
             actor_id=self.actor_id,
             session_id=self.session_id,
-            k=5,
+            k=5,  # Last 5 conversation turns
         )
-        event.agent.messages = context_messages
+        if recent_turns:
+            context_messages = []
+            for turn in recent_turns:
+                for message in turn:
+                    role = "assistant" if message["role"] == "ASSISTANT" else "user"
+                    context_messages.append(
+                        {"role": role, "content": [{"text": message["content"]["text"]}]}
+                    )
+            event.agent.messages = context_messages  # Inject history into agent
 
     def on_message_added(self, event: MessageAddedEvent):
-        """Retrieve relevant memories and save new ones."""
-        # Semantic retrieval
-        memories = self.memory_client.retrieve_memories(
-            memory_id=self.memory_id,
-            namespace=f"support/user/{self.actor_id}/preferences",
-            query=user_query,
-            top_k=3
-        )
-        # Save the conversation
+        """Called after each message — retrieves relevant memories and saves new ones."""
+        messages = event.agent.messages
+
+        if messages[-1]["role"] == "user":
+            user_query = messages[-1]["content"][0]["text"]
+
+            # RETRIEVE: Enrich the query with relevant long-term memories
+            preferences = self.memory_client.retrieve_memories(
+                memory_id=self.memory_id,
+                namespace=f"support/user/{self.actor_id}/preferences",
+                query=user_query,
+                top_k=3
+            )
+            if preferences:
+                context = "\n\nUser preferences:\n" + "\n".join(
+                    m["content"]["text"] for m in preferences
+                )
+                event.agent.messages[-1]["content"][0]["text"] += context
+
+        # SAVE: Persist the conversation turn as an event
         self.memory_client.save_conversation(
             memory_id=self.memory_id,
             actor_id=self.actor_id,
             session_id=self.session_id,
-            messages=[(message_content, message_role)]
+            messages=[(messages[-1]["content"][0]["text"], messages[-1]["role"])]
         )
+
+    def register_hooks(self, registry: HookRegistry):
+        registry.add_callback(MessageAddedEvent, self.on_message_added)
+        registry.add_callback(AgentInitializedEvent, self.on_agent_initialized)
 ```
 
-**Using hooks with Strands Agent:**
+**Wiring hooks to a Strands agent:**
 
 ```python
+from strands import Agent
+
+memory_hook = MemoryHook(memory_client, memory_id, actor_id, session_id)
+
 agent = Agent(
     model=model,
     tools=tools,
     system_prompt=SYSTEM_PROMPT,
-    hooks=[memory_hooks],  # Hooks automatically handle memory I/O
+    hooks=[memory_hook],  # Hooks automatically handle all memory I/O
 )
+result = agent("What was the database issue we investigated last week?")
+# → Agent automatically: loads history, retrieves relevant memories, saves this turn
 ```
 
-📁 **Code**: [`01-tutorials/04-AgentCore-memory/`](./01-tutorials/04-AgentCore-memory/)
+### 4.7 Holistic Example: SRE Agent with All Memory Types
 
-### 4.5 Memory Comparison
+The [`02-use-cases/SRE-agent/`](./02-use-cases/SRE-agent/) provides the most complete memory example in the repository — a Site Reliability Engineering agent that uses **three memory strategies simultaneously** across a multi-agent LangGraph architecture.
 
-| Aspect | Short-Term | Long-Term (Semantic) | Long-Term (User Pref) | Long-Term (Episodic) |
-|--------|-----------|---------------------|----------------------|---------------------|
-| **Scope** | Single session | Cross-session | Cross-session | Cross-session |
-| **Storage** | Event log | Vector embeddings | Structured preferences | Narrative episodes |
-| **Retrieval** | Sequential reads | Similarity search | Direct lookup | Episode-based search |
-| **Use case** | Conversation context | "What facts are relevant?" | "What does user prefer?" | "What happened before?" |
-| **Consolidation** | N/A | Merges similar facts | Updates existing prefs | Merges related episodes |
+#### Architecture
+
+```
+┌──────────────────────────────────────────────────────────────────────┐
+│                    SRE Agent (LangGraph Orchestrator)                 │
+│                                                                      │
+│  User: "The API gateway is timing out again"                         │
+│                                                                      │
+│  ┌───────────────────────────────────────────────────────────────┐   │
+│  │                    Memory Hook Provider                        │   │
+│  │                                                               │   │
+│  │  on_investigation_start():                                    │   │
+│  │    ├── retrieve_memories("preferences", user_id, ...)         │   │
+│  │    │     → "User prefers Slack over email for alerts"         │   │
+│  │    │     → "Escalation threshold: P2+"                        │   │
+│  │    ├── retrieve_memories("infrastructure", user_id, query)    │   │
+│  │    │     → "API gateway connects to payment-service:8443"     │   │
+│  │    │     → "Last timeout was caused by connection pool"       │   │
+│  │    └── retrieve_memories("investigations", user_id, query)    │   │
+│  │          → "Previous investigation found rate limiter bug"    │   │
+│  │                                                               │   │
+│  │  on_agent_response():                                         │   │
+│  │    ├── extract_user_preferences(response)                     │   │
+│  │    └── extract_infrastructure_knowledge(response)             │   │
+│  │                                                               │   │
+│  │  on_investigation_complete():                                 │   │
+│  │    └── save_investigation_summary(findings, timeline, status) │   │
+│  └───────────────────────────────────────────────────────────────┘   │
+│                                                                      │
+│  ┌──────────┐  ┌──────────┐  ┌───────────┐  ┌──────────────────┐   │
+│  │ Monitor  │  │ Diagnose │  │ Remediate │  │ Communicate      │   │
+│  │ Agent    │  │ Agent    │  │ Agent     │  │ Agent            │   │
+│  └──────────┘  └──────────┘  └───────────┘  └──────────────────┘   │
+└──────────────────────────────────────────────────────────────────────┘
+```
+
+#### Memory Setup (Three Strategies)
+
+```python
+# From: 02-use-cases/SRE-agent/sre_agent/memory/client.py
+
+class SREMemoryClient:
+    def __init__(self, memory_name="sre_agent_memory", region="us-east-1"):
+        self.client = MemoryClient(region_name=region)
+        self._initialize_memories()
+
+    def _initialize_memories(self):
+        """Create memory with 3 strategies for different knowledge types."""
+
+        # Strategy 1: USER PREFERENCES (user-scoped, no session)
+        # "How does this user like to be notified? What are their escalation thresholds?"
+        self.client.add_user_preference_strategy_and_wait(
+            memory_id=self.memory_id,
+            name="user_preferences",
+            description="Escalation preferences, notification channels, workflow settings",
+            namespaces=["/sre/users/{actorId}/preferences"]  # No session — global for user
+        )
+
+        # Strategy 2: SEMANTIC (session-scoped, cross-session searchable)
+        # "What do we know about the infrastructure? What patterns have we seen?"
+        self.client.add_semantic_strategy_and_wait(
+            memory_id=self.memory_id,
+            name="infrastructure_knowledge",
+            description="Infrastructure dependencies, performance patterns, configurations",
+            namespaces=["/sre/infrastructure/{actorId}/{sessionId}"]  # Per-session storage
+        )
+
+        # Strategy 3: SUMMARY (session-scoped)
+        # "What happened in previous investigations?"
+        self.client.add_summary_strategy_and_wait(
+            memory_id=self.memory_id,
+            name="investigation_summaries",
+            description="Investigation summaries with findings, timelines, and resolutions",
+            namespaces=["/sre/investigations/{actorId}/{sessionId}"]
+        )
+```
+
+#### Investigation Hooks (Load → Enrich → Save)
+
+```python
+# From: 02-use-cases/SRE-agent/sre_agent/memory/hooks.py
+
+class MemoryHookProvider:
+
+    def on_investigation_start(self, query, user_id, session_id):
+        """LOAD: Retrieve all relevant context when investigation begins."""
+
+        # 1. User preferences (always user-scoped, no session filter)
+        preferences = self.memory_client.retrieve_memories(
+            memory_type="preferences", actor_id=user_id,
+            query="escalation notification workflow"
+        )
+        # → "Prefers Slack alerts", "Escalation: P2+ only"
+
+        # 2. Infrastructure knowledge (cross-session search)
+        infra = self.memory_client.retrieve_memories(
+            memory_type="infrastructure", actor_id=user_id,
+            query=query,
+            session_id=None  # No session → searches ALL sessions
+        )
+        # → "API gateway → payment-service:8443", "Connection pool: max 100"
+
+        # 3. Past investigations (cross-session search)
+        investigations = self.memory_client.retrieve_memories(
+            memory_type="investigations", actor_id=user_id,
+            query=query,
+            session_id=None  # No session → searches ALL investigations
+        )
+        # → "2024-01-15: Rate limiter bug caused similar timeout"
+
+        return {"preferences": preferences, "infrastructure": infra, "investigations": investigations}
+
+    def on_agent_response(self, agent_name, response, state):
+        """ENRICH: Extract knowledge from agent responses during investigation."""
+
+        # Automatically extract infrastructure facts from diagnostic output
+        if agent_name in ["monitor_agent", "diagnose_agent"]:
+            self._extract_infrastructure_knowledge(response, state)
+            # e.g., "payment-service memory usage: 85% (threshold: 90%)"
+
+        # Extract user preferences from any expressed preferences
+        self._extract_user_preferences(response, state)
+
+    def on_investigation_complete(self, state, final_response, actor_id):
+        """SAVE: Persist investigation summary for future reference."""
+
+        summary = {
+            "incident_id": state["incident_id"],
+            "query": state["current_query"],
+            "timeline": self._extract_timeline(state["agent_results"]),
+            "actions_taken": state["agents_invoked"],
+            "key_findings": self._extract_key_findings(final_response),
+            "resolution_status": self._determine_status(final_response),
+        }
+
+        self.memory_client.save_event(
+            memory_type="investigations",
+            actor_id=actor_id,
+            event_data=json.dumps(summary),
+            session_id=state["session_id"]
+        )
+```
+
+#### How It All Connects
+
+**Session 1** (Monday): User investigates API gateway timeout.
+- Agent discovers: payment-service is at 85% memory, connection pool exhausted
+- **Semantic memory** saves: "API gateway → payment-service dependency", "connection pool max=100"
+- **User preference** saves: "User prefers Slack notifications for P2+"
+- **Summary** saves: "API timeout caused by connection pool exhaustion, resolved by scaling"
+
+**Session 2** (Thursday): Same user, new timeout incident.
+- Agent loads: previous investigation summary, infrastructure knowledge, user preferences
+- Agent says: *"I found a similar issue last Monday — connection pool exhaustion on payment-service. Last time we scaled the connection pool from 100 to 200. Should I check the current pool configuration?"*
+- The agent **remembers across sessions** — without the user repeating context.
+
+### 4.8 Underlying Technology Hypotheses
+
+Here is a synthesis of what the code patterns reveal about the underlying infrastructure:
+
+#### Event Store (Short-Term)
+
+> **[Hypothesis]**: Events are likely stored in **Amazon DynamoDB** with a composite key of `(memory_id, actor_id, session_id, timestamp)`. This explains:
+> - Fast writes (DynamoDB single-digit millisecond latency)
+> - Ordered reads (`list_events` returns chronological order)
+> - TTL support (`event_expiry_days` maps to DynamoDB TTL)
+> - The `get_last_k_turns` method suggesting a `ScanIndexForward=False, Limit=k` query
+
+#### Vector Index (Long-Term Retrieval)
+
+> **[Hypothesis]**: Extracted memories are embedded and stored in **Amazon OpenSearch Serverless** with vector engine (k-NN plugin), or possibly a managed **Amazon Bedrock Knowledge Base** index. Evidence:
+> - `retrieve_memories(query=...)` performs semantic similarity search
+> - Namespace-based filtering suggests metadata filtering on the vector index
+> - The `top_k` parameter maps directly to k-NN search parameters
+> - Cross-session search (omit `{sessionId}`) works like a prefix filter on metadata
+
+#### Extraction Pipeline
+
+> **[Hypothesis]**: The managed extraction pipeline likely runs as:
+> 1. **DynamoDB Streams** or **EventBridge** detects trigger conditions (message count, token count, idle timeout)
+> 2. A **Step Functions** or **Lambda** workflow reads recent events
+> 3. **Amazon Bedrock** (Claude Haiku) extracts facts/preferences/episodes using strategy-specific prompts
+> 4. **Amazon Titan Embeddings** (or Cohere) converts extracted text to vectors
+> 5. Vectors are indexed in the vector store with namespace metadata
+>
+> The self-managed pipeline confirms this architecture — it uses the exact same stages (SNS → SQS → Lambda → Bedrock → `batch_create_memory_records`) but lets you control the extraction logic.
+
+#### Consolidation (Deduplication)
+
+> **[Hypothesis]**: The consolidation step (mentioned in strategy configs) likely:
+> 1. Retrieves existing memories in the same namespace
+> 2. Uses an LLM to compare new extractions with existing ones
+> 3. **Merges** similar facts (e.g., "Database has 3 replicas" + "Database now has 5 replicas" → "Database has 5 replicas")
+> 4. **Updates** user preferences (new preferences override old ones)
+> 5. **Extends** episodes (adding follow-up outcomes to existing episodes)
+>
+> This is why the custom strategy config has separate `extraction_config` and `consolidation_config` — they're two distinct LLM calls with different prompts.
+
+### 4.9 Complete API Reference
+
+```python
+from bedrock_agentcore.memory import MemoryClient
+client = MemoryClient(region_name="us-east-1")
+
+# ── MEMORY LIFECYCLE ──
+client.create_memory_and_wait(name, strategies, description, event_expiry_days, max_wait, poll_interval)
+client.list_memories()
+client.delete_memory(memory_id)
+
+# ── STRATEGY MANAGEMENT ──
+client.add_user_preference_strategy_and_wait(memory_id, name, description, namespaces)
+client.add_semantic_strategy_and_wait(memory_id, name, description, namespaces)
+client.add_summary_strategy_and_wait(memory_id, name, description, namespaces)
+client.get_memory_strategies(memory_id)
+
+# ── SHORT-TERM (Events) ──
+client.create_event(memory_id, actor_id, session_id, messages)    # Save conversation turns
+client.list_events(memory_id, actor_id, session_id, max_results)  # List raw events
+client.get_last_k_turns(memory_id, actor_id, session_id, k)       # Get recent turns
+
+# ── LONG-TERM (Memories) ──
+client.retrieve_memories(memory_id, namespace, query, top_k)       # Semantic search
+client.save_conversation(memory_id, actor_id, session_id, messages) # Save + trigger extraction
+
+# ── LOW-LEVEL (boto3) ──
+data_client.create_event(memoryId, actorId, sessionId, eventTimestamp, payload, clientToken)
+data_client.batch_create_memory_records(memoryId, records, clientToken)
+control_client.create_memory(name, memoryExecutionRoleArn, eventExpiryDuration, memoryStrategies)
+control_client.list_memories(filters)
+```
+
+### 4.10 Memory Comparison Table
+
+| Aspect | Short-Term (Events) | Semantic | User Preference | Summary | Custom (Self-Managed) |
+|--------|---------------------|----------|-----------------|---------|----------------------|
+| **Stores** | Raw conversation | Extracted facts | User settings | Condensed summaries | Anything you define |
+| **Scoped by** | Session | Namespace (± session) | User only | Session | Namespace |
+| **Retrieval** | `get_last_k_turns()` | `retrieve_memories()` | `retrieve_memories()` | `retrieve_memories()` | `retrieve_memories()` |
+| **Search type** | Sequential | Semantic similarity | Semantic/structured | Semantic | Your choice |
+| **Consolidation** | N/A | Merges similar facts | Updates preferences | Extends summaries | Your Lambda |
+| **Extraction** | N/A (stored as-is) | Auto (managed) | Auto (managed) | Auto (managed) | Your Lambda |
+| **Expiry** | `event_expiry_days` | Indefinite | Indefinite | Indefinite | Your choice |
+| **Hypothesis: Backend** | DynamoDB | Vector DB (OpenSearch) | DynamoDB + Vector | DynamoDB + Vector | Your pipeline |
+
+📁 **Code**: [`01-tutorials/04-AgentCore-memory/`](./01-tutorials/04-AgentCore-memory/), [`02-use-cases/SRE-agent/sre_agent/memory/`](./02-use-cases/SRE-agent/sre_agent/memory/), [`02-use-cases/market-trends-agent/deploy.py`](./02-use-cases/market-trends-agent/deploy.py)
 
 ---
 
