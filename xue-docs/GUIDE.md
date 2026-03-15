@@ -7,6 +7,7 @@ This guide explains how to build, test, deploy, and invoke AI agents using **Ama
 ## Table of Contents
 
 1. [What Is Amazon Bedrock AgentCore?](#1-what-is-amazon-bedrock-agentcore)
+   - [Architecture Diagrams](#11-architecture-diagrams)
 2. [Writing Agent Code: Multiple Frameworks](#2-writing-agent-code-multiple-frameworks)
 3. [Agent Capabilities: From Simple Chat to Powerful Tooling](#3-agent-capabilities-from-simple-chat-to-powerful-tooling)
 4. [Agent Memory: Short-Term, Long-Term, and Memory Types](#4-agent-memory-short-term-long-term-and-memory-types)
@@ -65,6 +66,132 @@ if __name__ == "__main__":
 `BedrockAgentCoreApp` wraps your agent logic in an HTTP server that listens on port 8080 at the `/invocations` endpoint. This is the **contract** between your code and the AgentCore runtime — regardless of which framework you use.
 
 > **[Hypothesis]** The runtime likely uses a health-check endpoint and scales instances based on request volume, similar to SageMaker hosting endpoints. The `@app.entrypoint` decorator registers your function as the handler for POST requests to `/invocations`.
+
+---
+
+## 1.1 Architecture Diagrams
+
+The diagrams below show how the components of AgentCore relate to your agent code, and clarify **what is a service**, **what is a library**, and **how they communicate**.
+
+### Diagram 1: Full AgentCore Architecture — Services, Libraries, and Communication
+
+```
+                        ┌──────────────────────────────────────────────┐
+                        │          YOUR AGENT CODE                     │
+                        │  (Strands / LangGraph / CrewAI / any fw)     │
+                        │                                              │
+                        │  ┌──────────────────────────────────────┐    │
+                        │  │  bedrock_agentcore SDK  [LIBRARY]    │    │
+                        │  │  ├─ BedrockAgentCoreApp (HTTP host)  │    │
+                        │  │  ├─ identity.auth (@requires_access_ │    │
+                        │  │  │   token decorator)                │    │
+                        │  │  └─ memory client (events/memories)  │    │
+                        │  └──────────────────────────────────────┘    │
+                        └──────────┬──────────┬──────────┬─────────────┘
+                    HTTPS/REST │      │ MCP    │ HTTPS/REST
+                    (SigV4)    │      │(JSON-  │ (SigV4)
+                               │      │ RPC)   │
+          ┌────────────────────┘      │        └────────────────────┐
+          ▼                           ▼                             ▼
+ ┌─────────────────┐     ┌──────────────────────┐      ┌─────────────────────┐
+ │  AgentCore       │     │  AgentCore Gateway    │      │  AgentCore Memory   │
+ │  Identity        │     │  [SERVICE]            │      │  [SERVICE]          │
+ │  [SERVICE]       │     │                       │      │                     │
+ │                  │     │  MCP proxy: converts   │      │  Short-term: Events │
+ │  Token vault:    │     │  REST APIs / Lambdas   │      │  Long-term: Memories│
+ │  stores OAuth    │     │  into MCP tools        │      │  (semantic search)  │
+ │  tokens per-user │     │                       │      │                     │
+ │  (encrypted)     │     │  ┌─────────────────┐  │      └─────────────────────┘
+ │                  │     │  │ Policy Engine    │  │
+ └───────┬─────────┘     │  │ [SERVICE]        │  │
+         │               │  │ Cedar rules      │  │
+         │ OAuth2         │  │ ALLOW / DENY     │  │
+         │ flows          │  └────────┬────────┘  │
+         ▼               │           │            │
+ ┌─────────────────┐     └─────┬─────┴────────────┘
+ │  External IdPs   │          │
+ │  (Google, GitHub, │          │ HTTPS (REST / Lambda invoke)
+ │   Slack, etc.)   │          ▼
+ └─────────────────┘  ┌─────────────────────────────┐
+                      │  Your Backend APIs / Tools    │
+                      │  (REST APIs, Lambda, DBs)     │
+                      └─────────────────────────────────┘
+```
+
+**Legend:**
+| Symbol | Meaning |
+|--------|---------|
+| `[LIBRARY]` | Code that runs **inside** your agent container (imported via `pip install`) |
+| `[SERVICE]` | Managed AWS service that runs **outside** your agent (called over the network) |
+| `HTTPS/REST (SigV4)` | AWS-authenticated API calls (signed with IAM credentials) |
+| `MCP (JSON-RPC)` | Model Context Protocol — JSON-RPC 2.0 over HTTPS to the Gateway |
+| `OAuth2 flows` | Token exchange with external identity providers (Google, GitHub, etc.) |
+
+### Diagram 2: Request Flow — What Happens When a User Talks to Your Agent
+
+```
+  ┌──────────┐   HTTPS (SigV4 or Cognito JWT)    ┌───────────────────────────────────┐
+  │  Caller   │ ─────────────────────────────────→│  AgentCore Runtime  [SERVICE]     │
+  │(App/User) │                                   │  (Managed container hosting)       │
+  └──────────┘                                    │                                   │
+                                                  │  POST /invocations                │
+                                                  │         │                         │
+                                                  │         ▼                         │
+                                                  │  ┌─────────────────────────────┐  │
+                                                  │  │  YOUR AGENT CODE            │  │
+                                                  │  │  @app.entrypoint            │  │
+                                                  │  │                             │  │
+                                                  │  │  1. LLM decides to use tool │  │
+                                                  │  │  2. Tool needs OAuth token  │  │
+                                                  │  │     → @requires_access_token│  │
+                                                  │  │     → Identity Service      │  │
+                                                  │  │  3. Tool calls Gateway      │  │
+                                                  │  │     → MCP tools/call        │  │
+                                                  │  │     → Policy checks (Cedar) │  │
+                                                  │  │     → Backend API invoked   │  │
+                                                  │  │  4. Store conversation       │  │
+                                                  │  │     → Memory Service        │  │
+                                                  │  │  5. Return response          │  │
+                                                  │  └─────────────────────────────┘  │
+                                                  └───────────────────────────────────┘
+```
+
+### Diagram 3: Identity Flows — USER_FEDERATION (3LO) vs M2M
+
+```
+ SCENARIO A: User's own data (3-legged OAuth / USER_FEDERATION)
+ ═══════════════════════════════════════════════════════════════
+
+  ┌───────┐    ┌──────────────┐    ┌──────────────────┐    ┌──────────┐
+  │ Alice │───→│ Agent (ACME) │───→│ AgentCore        │───→│ Google   │
+  │(user) │    │              │    │ Identity Service  │    │ OAuth2   │
+  └───┬───┘    └──────────────┘    └──────────────────┘    └────┬─────┘
+      │                                                         │
+      │  ◄─── "Please authorize ACME to read your calendar" ───┘
+      │                                                         │
+      └────── Alice clicks "Allow" ──────────────────────────→ │
+                                                                │
+              Token stored per-user ◄──── Alice's token ────────┘
+              (Alice ≠ Bob)
+
+  auth_flow = "USER_FEDERATION"
+  Each user consents individually. Alice's token ≠ Bob's token.
+
+
+ SCENARIO B: Shared service account (Client Credentials / M2M)
+ ═══════════════════════════════════════════════════════════════
+
+  ┌──────────────┐    ┌──────────────────┐    ┌──────────────────┐
+  │ Agent (ACME) │───→│ AgentCore        │───→│ Service OAuth2   │
+  │              │    │ Identity Service  │    │ (e.g., Cognito,  │
+  └──────────────┘    └──────────────────┘    │  Databricks)     │
+                                               └──────────────────┘
+  No user consent screen.
+  Agent authenticates as ITSELF using Client ID + Secret.
+  All requests share the same service-level token.
+
+  auth_flow = "M2M"
+```
 
 ---
 
@@ -1641,31 +1768,190 @@ For human-facing apps, you can integrate **Amazon Cognito** for OAuth2/OIDC auth
 
 ### 6.2 Outbound Auth: Agent Accessing External Services
 
-When your agent needs to call external APIs (Google Calendar, Slack, GitHub) on behalf of a user, AgentCore provides **3-legged OAuth**:
+When your agent needs to call external APIs (Google Calendar, Slack, GitHub), AgentCore Identity handles the full OAuth2 lifecycle — token acquisition, encrypted storage, and automatic refresh.
+
+#### 6.2.1 What Are Client ID and Client Secret?
+
+Think of it like a **building access system**:
+
+- **Client ID** = Your company's badge number (identifies *which application* is requesting access — this value is not secret and may appear in URLs)
+- **Client Secret** = The private PIN paired with that badge (proves the application is legitimate — **this must be kept confidential**, never exposed in client-side code, logs, or version control)
+
+When you build an agent that accesses Google Calendar, you first go to the **Google Cloud Console** and register your application. Google issues you a Client ID and Client Secret that are **unique to your company**. Every company gets its own pair — they are never shared across organizations.
+
+**Where do they go?** You register them with AgentCore Identity by calling `create_oauth2_credential_provider()`. AgentCore stores the secret securely in AWS Secrets Manager. Your agent code never hardcodes or directly handles the secret — it only references the `provider_name`.
+
+#### 6.2.2 Real-World Example: Company ACME Builds a Calendar Agent
+
+Let's say ACME builds an agent that needs to access Google Calendar. There are two distinct scenarios:
+
+---
+
+**Scenario 1: Each user sees their own calendar (3-Legged OAuth / `USER_FEDERATION`)**
+
+This is the pattern in `01-tutorials/03-AgentCore-identity/05-Outbound_Auth_3lo/`.
+
+**Step 1 — ACME developer registers with Google (one-time):**
+
+Go to Google Cloud Console → create an OAuth 2.0 app → get:
+- `ACME_CLIENT_ID = "abc123.apps.googleusercontent.com"`
+- `ACME_CLIENT_SECRET = "GOCSPX-xyz789"`
+
+**Step 2 — ACME developer registers these with AgentCore Identity (one-time):**
 
 ```python
-# 01-tutorials/03-AgentCore-identity/05-Outbound_Auth_3lo/strands_claude_google_3lo.py
-from bedrock_agentcore.identity.auth import requires_access_token
+# From: 02-use-cases/customer-support-assistant/scripts/google_credentials_provider.py
+google_provider = identity_client.create_oauth2_credential_provider(
+    name="acme-google-calendar",              # ACME picks this name
+    credentialProviderVendor="GoogleOauth2",   # Predefined vendor
+    oauth2ProviderConfigInput={
+        "googleOauth2ProviderConfig": {
+            "clientId": "abc123.apps.googleusercontent.com",
+            "clientSecret": "GOCSPX-xyz789",
+        }
+    },
+)
+# Returns: provider ARN, callback URL (register with Google), secret ARN
+```
+
+**Step 3 — Agent tool uses `@requires_access_token` with `auth_flow="USER_FEDERATION"`:**
+
+```python
+# From: 01-tutorials/03-AgentCore-identity/05-Outbound_Auth_3lo/strands_claude_google_3lo.py
+SCOPES = ["https://www.googleapis.com/auth/calendar.readonly"]
 
 @tool(name="Get_calendar_events_today")
 async def get_calendar():
     @requires_access_token(
-        provider_name="google-cal-provider",
-        scopes=["https://www.googleapis.com/auth/calendar.readonly"]
+        provider_name="acme-google-calendar",        # matches name from Step 2
+        scopes=SCOPES,
+        auth_flow="USER_FEDERATION",                 # 3-legged: user must consent
+        on_auth_url=on_auth_url,                     # callback when auth URL is ready
+        force_authentication=True,                   # always prompt for auth
+        callback_url=os.environ["CALLBACK_URL"],     # where Google redirects after consent
     )
-    async def _inner(access_token):
-        credentials = Credentials(token=access_token)
-        service = build("calendar", "v3", credentials=credentials)
-        return service.events().list(
+    async def get_calendar_events_today(access_token: Optional[str] = "") -> str:
+        creds = Credentials(token=access_token, scopes=SCOPES)
+        service = build("calendar", "v3", credentials=creds)
+        return json.dumps(service.events().list(
             calendarId="primary",
             timeMin=start_of_day,
-            timeMax=end_of_day
-        ).execute()
+            timeMax=end_of_day,
+            singleEvents=True,
+            orderBy="startTime",
+        ).execute())
 
-    return await _inner()
+    return await get_calendar_events_today()
 ```
 
-> **[Hypothesis]** The `@requires_access_token` decorator likely triggers an OAuth flow where: (1) AgentCore stores the provider configuration (client ID, secret, auth URL), (2) on first use, the user is redirected to authenticate with the external service, (3) tokens are stored securely and refreshed automatically.
+**What happens at runtime when employee Alice uses ACME's agent:**
+
+```
+Alice → "Show me my calendar"
+  ↓
+Agent tool hits @requires_access_token → no token for Alice yet
+  ↓
+AgentCore Identity returns a Google auth URL → Alice's browser opens it
+  ↓
+Google shows: "ACME's Agent wants to read YOUR calendar. Allow?"
+  ↓
+Alice clicks "Allow" → Google redirects to callback URL with authorization code
+  ↓
+Callback server calls identity_client.complete_resource_token_auth()
+  ↓
+AgentCore stores Alice's token (encrypted, scoped to Alice only)
+  ↓
+Agent tool retries → gets Alice's access_token → calls Google Calendar API
+  ↓
+Alice sees HER calendar only (not Bob's, not anyone else's)
+```
+
+When Bob uses the same agent later, he goes through the same consent flow and sees **Bob's** calendar. Alice's token is never used for Bob.
+
+---
+
+**Scenario 2: Shared calendar via service account (Client Credentials / `M2M`)**
+
+This is for when the agent itself owns the access — no individual user consent needed.
+
+**Step 1 — ACME developer gets service credentials (one-time):**
+
+Create a service account (e.g., in Google Workspace with domain delegation, or in Cognito/Databricks/etc.) to get a service-level Client ID and Secret.
+
+**Step 2 — Register with AgentCore Identity:**
+
+```python
+# For predefined vendors (e.g., Cognito):
+provider = identity_client.create_oauth2_credential_provider(
+    name="acme-shared-calendar",
+    credentialProviderVendor="CustomOauth2",
+    oauth2ProviderConfigInput={
+        "customOauth2ProviderConfig": {
+            "oauthDiscovery": {
+                "authorizationServerMetadata": {
+                    "issuer": "https://accounts.google.com",
+                    "tokenEndpoint": "https://oauth2.googleapis.com/token",
+                }
+            },
+            "clientId": "service-abc.apps.googleusercontent.com",
+            "clientSecret": "GOCSPX-service-secret",
+        }
+    },
+)
+```
+
+**Step 3 — Agent tool uses `auth_flow="M2M"`:**
+
+```python
+# From: 02-use-cases/customer-support-assistant/agent_config/access_token.py
+@requires_access_token(
+    provider_name="acme-shared-calendar",
+    scopes=[],                  # Empty or service-specific scopes
+    auth_flow="M2M",            # Machine-to-machine: no user consent
+)
+async def get_shared_calendar(access_token: str):
+    # This token belongs to ACME's service account, not any individual user
+    creds = Credentials(token=access_token)
+    service = build("calendar", "v3", credentials=creds)
+    return service.events().list(calendarId="team-calendar@acme.com").execute()
+```
+
+**What happens at runtime:** No consent screen. The agent automatically authenticates as ACME's service account and reads the shared calendar. Every user sees the same data.
+
+#### 6.2.3 Side-by-Side: USER_FEDERATION vs M2M
+
+| | USER_FEDERATION (3LO) | M2M (Client Credentials) |
+|---|---|---|
+| **Who authenticates?** | Each end user (explicit consent) | The agent itself (automatic) |
+| **OAuth grant type** | Authorization Code | Client Credentials |
+| **User sees consent screen?** | ✅ Yes | ❌ No |
+| **Whose data is accessed?** | Individual user's data | Service account's shared data |
+| **Token scope** | Per-user (Alice ≠ Bob) | Per-agent (same for all requests) |
+| **`auth_flow` parameter** | `"USER_FEDERATION"` | `"M2M"` |
+| **Needs `callback_url`?** | ✅ Yes | ❌ No |
+| **Needs `on_auth_url`?** | ✅ Yes | ❌ No |
+| **Example use case** | "Show me MY Google Calendar" | "Show the team's shared calendar" |
+
+#### 6.2.4 Supported Predefined Vendors
+
+AgentCore Identity has built-in support for these OAuth2 providers (no custom discovery needed):
+
+| Vendor Constant | Provider | Config Key |
+|----------------|----------|------------|
+| `"GoogleOauth2"` | Google (Calendar, Drive, etc.) | `googleOauth2ProviderConfig` |
+| `"GithubOauth2"` | GitHub (repos, issues, PRs) | `githubOauth2ProviderConfig` |
+| `"CustomOauth2"` | Any OAuth2-compliant service | `customOauth2ProviderConfig` (requires `oauthDiscovery` with `authorizationServerMetadata` specifying `issuer`, `tokenEndpoint`, and optionally `authorizationEndpoint`) |
+
+#### 6.2.5 Key Clarifications
+
+**"Does the agent developer need to configure anything?"**
+→ **Yes.** You must: (1) register an OAuth app with the external provider (Google, GitHub, etc.) to get your own Client ID + Secret, then (2) call `create_oauth2_credential_provider()` to store those credentials securely in AgentCore. This is a one-time setup per provider.
+
+**"Is it the same Client ID and Secret for all agent developers?"**
+→ **No.** Every company gets their own Client ID and Secret from the external provider. AgentCore stores them in AWS Secrets Manager within the customer's own AWS account. Different AgentCore customers never share credentials.
+
+**"How does the code know what to use for `provider_name`?"**
+→ `provider_name` is an arbitrary string **you choose** when calling `create_oauth2_credential_provider(name="my-name")`. You then reference the same string in `@requires_access_token(provider_name="my-name")`. It's just a lookup key — like naming an AWS resource.
 
 📁 **Code**: [`01-tutorials/03-AgentCore-identity/`](./01-tutorials/03-AgentCore-identity/)
 
