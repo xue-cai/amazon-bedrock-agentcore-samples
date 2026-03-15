@@ -1774,8 +1774,8 @@ When your agent needs to call external APIs (Google Calendar, Slack, GitHub), Ag
 
 Think of it like a **building access system**:
 
-- **Client ID** = Your company's badge number (identifies *which application* is requesting access)
-- **Client Secret** = The private PIN paired with that badge (proves the application is legitimate)
+- **Client ID** = Your company's badge number (identifies *which application* is requesting access — this value is not secret and may appear in URLs)
+- **Client Secret** = The private PIN paired with that badge (proves the application is legitimate — **this must be kept confidential**, never exposed in client-side code, logs, or version control)
 
 When you build an agent that accesses Google Calendar, you first go to the **Google Cloud Console** and register your application. Google issues you a Client ID and Client Secret that are **unique to your company**. Every company gets its own pair — they are never shared across organizations.
 
@@ -1940,7 +1940,7 @@ AgentCore Identity has built-in support for these OAuth2 providers (no custom di
 |----------------|----------|------------|
 | `"GoogleOauth2"` | Google (Calendar, Drive, etc.) | `googleOauth2ProviderConfig` |
 | `"GithubOauth2"` | GitHub (repos, issues, PRs) | `githubOauth2ProviderConfig` |
-| `"CustomOauth2"` | Any OAuth2-compliant service | `customOauth2ProviderConfig` (requires `oauthDiscovery` with token/auth endpoints) |
+| `"CustomOauth2"` | Any OAuth2-compliant service | `customOauth2ProviderConfig` (requires `oauthDiscovery` with `authorizationServerMetadata` specifying `issuer`, `tokenEndpoint`, and optionally `authorizationEndpoint`) |
 
 #### 6.2.5 Key Clarifications
 
