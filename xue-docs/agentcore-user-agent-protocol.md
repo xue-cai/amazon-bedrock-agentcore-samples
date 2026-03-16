@@ -261,6 +261,8 @@ When the agent needs to access a **user's personal resources** — for example, 
 **1. One-time setup — Create an OAuth2 Credential Provider:**
 
 ```python
+import boto3
+
 # Register Google as an OAuth provider with AgentCore Identity
 identity_client = boto3.client("bedrock-agentcore-control")
 identity_client.create_oauth2_credential_provider(
@@ -278,7 +280,10 @@ identity_client.create_oauth2_credential_provider(
 **2. Agent tool — Use `@requires_access_token` decorator:**
 
 ```python
+from strands import tool
 from bedrock_agentcore.identity.auth import requires_access_token
+from google.oauth2.credentials import Credentials
+from googleapiclient.discovery import build
 
 @tool(name="Get_calendar_events_today")
 async def get_calendar():
@@ -298,7 +303,12 @@ async def get_calendar():
 **3. Callback server — Handle the OAuth redirect:**
 
 ```python
+from fastapi import FastAPI
+from fastapi.responses import HTMLResponse
 from bedrock_agentcore.services.identity import IdentityClient
+
+app = FastAPI()
+identity_client = IdentityClient(region="us-east-1")
 
 # In the callback server (FastAPI app running on port 9090):
 @app.get("/oauth2/callback")
