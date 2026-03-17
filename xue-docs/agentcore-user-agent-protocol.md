@@ -127,80 +127,194 @@ client = MCPClient(
 )
 ```
 
-## 5. Authentication Mechanisms
+## 5. Authentication for Agent Tools
 
-AgentCore supports two categories of authentication depending on the scenario:
+When your agent calls external APIs or tools, it needs authentication tokens. AgentCore Identity provides a unified decorator — `@requires_access_token` — that works for both service-to-service and user-delegated scenarios. The underlying OAuth flow differs, but the developer experience is intentionally similar.
 
-| Category | Flow | Use Case |
+| | **M2M (Service-to-Service)** | **USER_FEDERATION (User-Delegated)** |
 |---|---|---|
-| **M2M (Machine-to-Machine)** | OAuth2 Client Credentials | Service-to-service calls (agent → Gateway, internal APIs) |
-| **USER_FEDERATION (3-Legged OAuth)** | OAuth2 Authorization Code | Accessing a *user's own* resources (Google Calendar, GitHub repos) |
+| **When to use** | Agent calls an API as *itself* (service account) | Agent calls an API *on behalf of a specific user* |
+| **Example** | Agent → Gateway → internal REST API | Agent → Google Calendar API *for Alice* |
+| **OAuth grant type** | Client Credentials | Authorization Code (3-Legged OAuth / 3LO) |
+| **User browser needed?** | Never | Yes — for initial consent (one-time per resource) |
+| **Callback server needed?** | No | Yes — developer-deployed |
 
-### 5a. M2M: OAuth2 Client Credentials (Service-to-Service)
+### 5.1 Agent Code Comparison
 
-Uses Cognito OAuth2 client credentials flow — no user interaction required:
+Both flows use the same decorator — `@requires_access_token` from `bedrock_agentcore.identity.auth`. The key differences are `auth_flow`, `scopes`, and callback parameters.
 
-```python
-token_url = f"https://{domain}.auth.{region}.amazoncognito.com/oauth2/token"
-response = requests.post(token_url, data={
-    "grant_type": "client_credentials",
-    "client_id": client_id,
-    "client_secret": client_secret,
-    "scope": scope,
-})
-access_token = response.json()["access_token"]
-```
-
-### 5b. USER_FEDERATION: 3-Legged OAuth (User-Delegated Access)
-
-When the agent needs to access a **user's own resources** (e.g., "read my Google Calendar"), the user must explicitly grant consent in their browser. This uses the standard **OAuth 2.0 Authorization Code Grant** (also called 3-Legged OAuth or 3LO), managed by **AgentCore Identity**.
-
-See [Section 6: OAuth User-Consent Flow](#oauth-user-consent-flow-3-legged-oauth) for the full walkthrough.
-
-### AWS SigV4 (IAM Authentication for A2A)
+**M2M (Service-to-Service):**
 
 ```python
-from botocore.auth import SigV4Auth
-from botocore.awsrequest import AWSRequest
+from bedrock_agentcore.identity.auth import requires_access_token
 
-aws_request = AWSRequest(method="POST", url=url, data=body, headers=headers)
-SigV4Auth(credentials, "bedrock-agentcore", region).add_auth(aws_request)
+@requires_access_token(
+    provider_name="my-cognito-provider",   # Cognito-backed credential provider
+    scopes=[],                              # M2M: empty scopes
+    auth_flow="M2M",                        # Client Credentials flow
+)
+def get_gateway_token(access_token: str) -> str:
+    return access_token
+
+# Usage: call the function, token is injected automatically
+token = get_gateway_token()
+headers = {"Authorization": f"Bearer {token}"}
+# Pass headers to Gateway MCP client, REST API, etc.
 ```
 
-### JWT Token Extraction in Agent Runtime
+**USER_FEDERATION (User-Delegated):**
 
 ```python
-def _get_bearer_token(context) -> Optional[str]:
-    auth = (getattr(context, "request_headers", None) or {}).get("Authorization", "")
-    return auth[7:] if auth.startswith("Bearer ") else None
+from bedrock_agentcore.identity.auth import requires_access_token
+from strands import tool
+
+@tool(name="Get_calendar_events")
+async def get_calendar():
+    @requires_access_token(
+        provider_name="google-cal-provider",                # Google/GitHub/etc.
+        scopes=["https://www.googleapis.com/auth/calendar.readonly"],  # OAuth scopes
+        auth_flow="USER_FEDERATION",                        # 3-Legged OAuth
+        on_auth_url=on_auth_url,                            # Callback for consent URL
+        callback_url=os.environ["CALLBACK_URL"],            # Redirect URI after consent
+    )
+    async def get_events(access_token: Optional[str] = "") -> str:
+        creds = Credentials(token=access_token)
+        service = build("calendar", "v3", credentials=creds)
+        # ... call API with user's token
+    return await get_events()
 ```
 
-## 6. Typical Webapp Architecture
+**Parameter differences at a glance:**
 
-For a travel agent exposed as a webapp, the architecture looks like:
+| Parameter | M2M | USER_FEDERATION |
+|---|---|---|
+| `auth_flow` | `"M2M"` | `"USER_FEDERATION"` |
+| `scopes` | `[]` (empty) | OAuth provider scopes (e.g., `calendar.readonly`) |
+| `on_auth_url` | Not needed | **Required** — receives auth URL when user consent needed |
+| `callback_url` | Not needed | **Required** — where browser redirects after consent |
+| Function pattern | Top-level function | Typically nested inside a `@tool` |
+| `access_token` injection | Always injected (no user interaction) | Injected after first consent; empty on very first call |
+
+### 5.2 One-Time Setup Comparison
+
+Both flows require creating an **OAuth2 Credential Provider** and a **Workload Identity**. USER_FEDERATION additionally requires a **callback server** and registering its URL.
+
+**M2M Setup:**
 
 ```
-Users (Browser) ──HTTP──▶ Your Webapp (Streamlit/React/FastAPI)
-                              │
-                              │ POST /runtimes/{arn}/invocations
-                              │ + Bearer Token + Session-Id header
-                              ▼
-                         AgentCore Runtime (your agent)
-                              │
-                              │ MCP (via Gateway)
-                              ▼
-                    Flight API, Hotel API, Google Calendar API
+Step 1: Create a Cognito User Pool + M2M app client
+        └─ AllowedOAuthFlows: ["client_credentials"]
+        └─ GenerateSecret: True
+
+Step 2: Register as a Credential Provider with AgentCore Identity
+        └─ create_oauth2_credential_provider(name="my-cognito-provider", ...)
+
+Step 3: Create Workload Identity for your agent
+        └─ create_workload_identity(name="my-agent-workload")
 ```
 
-- **User ↔ Webapp**: Whatever protocol you choose (standard HTTP, WebSocket, etc.)
-- **Webapp ↔ Agent**: AWS HTTP REST API with JSON payloads, authenticated via OAuth2 (Cognito) or IAM SigV4
-- **Agent ↔ Tools**: MCP via AgentCore Gateway
+```python
+# Step 1: Cognito M2M client (via AWS SDK or console)
+cognito.create_user_pool_client(
+    UserPoolId=pool_id,
+    ClientName="agent-m2m-client",
+    GenerateSecret=True,
+    AllowedOAuthFlows=["client_credentials"],
+    AllowedOAuthScopes=[scope_names],
+    AllowedOAuthFlowsUserPoolClient=True,
+)
 
-### OAuth User-Consent Flow (3-Legged OAuth)
+# Step 2: Register with AgentCore Identity
+control = boto3.client("bedrock-agentcore-control")
+control.create_oauth2_credential_provider(
+    name="my-cognito-provider",
+    credentialProviderVendor="CustomOauth2",
+    oauth2ProviderConfigInput={
+        "customOauth2ProviderConfig": {
+            "clientId": cognito_client_id,
+            "clientSecret": cognito_client_secret,
+            "oauthDiscovery": {
+                "authorizationServerMetadata": {
+                    "issuer": issuer_url,
+                    "authorizationEndpoint": auth_url,
+                    "tokenEndpoint": token_url,
+                    "responseTypes": ["code", "token"],
+                }
+            },
+        }
+    },
+)
 
-When the agent needs to access a **user's personal resources** — for example, reading Alice's Google Calendar or accessing Bob's GitHub repos — the user must explicitly grant permission via their browser. AgentCore Identity manages this using the **OAuth 2.0 Authorization Code Grant** (3LO).
+# Step 3: Workload Identity
+control.create_workload_identity(name="my-agent-workload")
+```
 
-#### How It Works: Step-by-Step
+**USER_FEDERATION Setup:**
+
+```
+Step 1: Register your app with the OAuth provider (Google Console, GitHub Settings, etc.)
+        └─ Obtain a client ID and client secret
+
+Step 2: Register as a Credential Provider with AgentCore Identity
+        └─ create_oauth2_credential_provider(name="google-cal-provider", ...)
+
+Step 3: Create Workload Identity + register callback URL
+        └─ create_workload_identity(name="my-agent-workload")
+        └─ update_workload_identity(allowedResourceOauth2ReturnUrls=[callback_url])
+
+Step 4: Deploy a Callback Server (see Section 5.5)
+```
+
+```python
+# Step 1: Obtain client_id and client_secret from Google/GitHub developer console
+
+# Step 2: Register with AgentCore Identity
+control = boto3.client("bedrock-agentcore-control")
+control.create_oauth2_credential_provider(
+    name="google-cal-provider",
+    credentialProviderVendor="GoogleOauth2",   # Or "CustomOauth2" for generic providers
+    oauth2ProviderConfigInput={
+        "googleOauth2ProviderConfig": {
+            "clientId": google_client_id,
+            "clientSecret": google_client_secret,
+        }
+    },
+)
+
+# Step 3: Workload Identity + register callback URL
+control.create_workload_identity(name="my-agent-workload")
+control.update_workload_identity(
+    name="my-agent-workload",
+    allowedResourceOauth2ReturnUrls=[
+        "http://localhost:9090/oauth2/callback",       # Local dev
+        # "https://your-domain.com/oauth2/callback",   # Production
+    ],
+)
+
+# Step 4: Deploy callback server (see Section 5.5)
+```
+
+### 5.3 Runtime Auth Flow Comparison
+
+#### M2M Flow (Automatic — No User Interaction)
+
+```
+Agent tool call
+      │
+      ▼
+@requires_access_token (auth_flow="M2M")
+      │
+      ▼
+AgentCore Identity: Use client credentials
+to get access token from Cognito token endpoint
+      │
+      ▼
+Token injected into function → Agent calls API
+```
+
+Every call follows the same path. No user interaction is ever needed. The decorator handles the client credentials exchange with the Cognito token endpoint automatically.
+
+#### USER_FEDERATION Flow (First Call Requires User Consent)
 
 ```
                                     ┌─────────────────┐
@@ -240,67 +354,56 @@ When the agent needs to access a **user's personal resources** — for example, 
                    └──────────────┘
 ```
 
-**Step 1 — User makes a request**: The user asks the agent (via the webapp) to do something that requires their personal data, e.g., *"Check my calendar for today."*
+**Step-by-step (USER_FEDERATION only — M2M skips all of this):**
 
-**Step 2 — Agent detects authorization is needed**: The agent's tool calls `@requires_access_token` with `auth_flow="USER_FEDERATION"`. AgentCore Identity checks its **token vault** for an existing token for this (user, resource) pair. If no token exists, it generates an **OAuth authorization URL** and returns it to the agent via the `on_auth_url` callback. The webapp presents this URL to the user (e.g., as a clickable link or redirect).
+1. **User makes request**: *"Check my calendar for today."*
+2. **Agent detects no token**: `@requires_access_token` checks the token vault for this (user, resource, scope) tuple. No token → generates an OAuth authorization URL → calls `on_auth_url` callback so the webapp can show it to the user.
+3. **User is redirected to OAuth provider**: Browser opens Google/GitHub consent screen.
+4. **User grants consent**: Clicks "Allow" on the provider's permission prompt.
+5. **OAuth provider redirects to callback**: Browser redirects to your callback server with a `session_id`.
+6. **Callback server completes the flow**: Calls `complete_resource_token_auth()` — tells AgentCore Identity to exchange the authorization code for access + refresh tokens.
+7. **Tokens stored in vault**: Per-user, encrypted. Each (agent, user, provider, scope) tuple gets its own token pair.
+8. **Agent retries with token**: `@requires_access_token` now finds the token in the vault and injects it as the `access_token` parameter.
 
-**Step 3 — User is redirected to the OAuth provider**: The user's browser opens the authorization URL, which points to the OAuth provider (e.g., Google's consent screen: `https://accounts.google.com/o/oauth2/v2/auth?...`).
+### 5.4 Credentials, Tokens & Lifecycle
 
-**Step 4 — User grants consent**: The user sees the provider's consent screen (e.g., *"AgentCore wants to access your Google Calendar. Allow?"*) and clicks **Allow**. This is a standard browser-based interaction — the user must be in a browser.
+This table compares every credential and token involved — where it comes from, where it's stored, who caches it, and who refreshes it.
 
-**Step 5 — OAuth provider redirects to callback**: After consent, the provider redirects the user's browser to the pre-registered **callback URL** (e.g., `http://localhost:9090/oauth2/callback?session_id=...`). This callback server is a lightweight FastAPI app that your webapp runs alongside the agent.
+| Credential / Token | M2M | USER_FEDERATION (3LO) |
+|---|---|---|
+| **OAuth Client ID** | Cognito User Pool client ID | Google/GitHub/etc. app client ID |
+| **OAuth Client Secret** | Cognito client secret | Google/GitHub/etc. app client secret |
+| ↳ *Created by* | Developer (Cognito console or API) | Developer (provider's developer console) |
+| ↳ *Stored in* | AgentCore Identity (encrypted, via credential provider config) | AgentCore Identity (encrypted, via credential provider config) |
+| ↳ *Lifetime* | Permanent (until rotated manually) | Permanent (until rotated manually) |
+| | | |
+| **Access Token** | Cognito JWT — proves the agent's service identity | Google/GitHub API token — proves user's delegated permission |
+| ↳ *Created by* | Cognito token endpoint (client credentials grant) | OAuth provider token endpoint (auth code exchange, or refresh) |
+| ↳ *Stored / cached in* | AgentCore Identity (in-process SDK cache) | AgentCore Identity Token Vault (encrypted, per-user) |
+| ↳ *Lifetime* | ~1 hour (Cognito default) | ~1 hour (varies by provider) |
+| ↳ *Refreshed by* | **AgentCore Identity** — re-fetches using client credentials | **AgentCore Identity** — uses stored refresh token silently |
+| ↳ *User action needed to refresh?* | No — fully automatic | No — fully automatic (as long as refresh token is valid) |
+| | | |
+| **Refresh Token** | ❌ Not applicable (client credentials don't issue refresh tokens) | Long-lived token for re-obtaining access tokens without user consent |
+| ↳ *Stored in* | — | AgentCore Identity Token Vault (encrypted, per-user) |
+| ↳ *Lifetime* | — | ~90 days (varies by provider; requires `offline_access` scope) |
+| ↳ *When it expires* | — | User must re-consent in browser |
+| | | |
+| **Authorization Code** | ❌ Not applicable | Temporary code from OAuth provider after user grants consent |
+| ↳ *Stored in* | — | Never stored — used once, immediately exchanged for tokens |
+| ↳ *Lifetime* | — | ~10 minutes (single use) |
+| | | |
+| **User Identity Token** | ❌ Not applicable (no user involved) | User's Cognito JWT — identifies *which user* the token belongs to |
+| ↳ *Stored in* | — | Client-side (browser/notebook) |
+| ↳ *Lifetime* | — | ~1 hour (Cognito) |
 
-**Step 6 — Callback server completes the flow**: The callback server receives the redirect, extracts the `session_id`, and calls `identity_client.complete_resource_token_auth(session_uri=session_id, user_identifier=user_token_identifier)`. This tells AgentCore Identity to exchange the authorization code for access and refresh tokens.
+### 5.5 Callback Server (USER_FEDERATION Only)
 
-**Step 7 — Tokens stored in vault**: AgentCore Identity stores the tokens in an **encrypted, per-user token vault**. Each user gets their own token — Alice's Google Calendar token is completely separate from Bob's. The tokens are access-controlled so that only the specific (agent, user) pair can retrieve them.
+**You must write and deploy the callback server yourself** — AgentCore Identity does not provide a built-in callback endpoint. It's a lightweight HTTP server (~20–30 lines of route logic) that:
 
-**Step 8 — Agent retries with the token**: On subsequent invocations (or automatic retry), `@requires_access_token` now finds a valid token in the vault and injects it as the `access_token` parameter. The agent uses it to call the Google Calendar API directly.
-
-#### Key Implementation Details
-
-**1. One-time setup — Create an OAuth2 Credential Provider:**
-
-```python
-import boto3
-
-# Register Google as an OAuth provider with AgentCore Identity
-identity_client = boto3.client("bedrock-agentcore-control")
-identity_client.create_oauth2_credential_provider(
-    name="google-cal-provider",
-    credentialProviderVendor="GoogleOauth2",
-    oauth2ProviderConfigInput={
-        "googleOauth2ProviderConfig": {
-            "clientId": "your-google-client-id",
-            "clientSecret": "your-google-client-secret",
-        }
-    },
-)
-```
-
-**2. Agent tool — Use `@requires_access_token` decorator:**
-
-```python
-from strands import tool
-from bedrock_agentcore.identity.auth import requires_access_token
-from google.oauth2.credentials import Credentials
-from googleapiclient.discovery import build
-
-@tool(name="Get_calendar_events_today")
-async def get_calendar():
-    @requires_access_token(
-        provider_name="google-cal-provider",        # Matches the provider created above
-        scopes=["https://www.googleapis.com/auth/calendar.readonly"],
-        auth_flow="USER_FEDERATION",                 # 3-legged OAuth (user consent required)
-        on_auth_url=on_auth_url,                     # Callback to surface auth URL to user
-        callback_url=os.environ["CALLBACK_URL"],     # Where Google redirects after consent
-    )
-    async def get_calendar_events_today(access_token: Optional[str] = "") -> str:
-        creds = Credentials(token=access_token)
-        service = build("calendar", "v3", credentials=creds)
-        # ... call Calendar API with user's token
-```
-
-**3. Callback server — Handle the OAuth redirect:**
+1. Listens for the OAuth provider's redirect: `GET /oauth2/callback?session_id=...`
+2. Calls `identity_client.complete_resource_token_auth()` to finalize the token exchange
+3. Shows the user a success page
 
 ```python
 from fastapi import FastAPI
@@ -310,7 +413,6 @@ from bedrock_agentcore.services.identity import IdentityClient
 app = FastAPI()
 identity_client = IdentityClient(region="us-east-1")
 
-# In the callback server (FastAPI app running on port 9090):
 @app.get("/oauth2/callback")
 async def handle_callback(session_id: str):
     identity_client.complete_resource_token_auth(
@@ -320,147 +422,98 @@ async def handle_callback(session_id: str):
     return HTMLResponse("<h1>Authorization successful! You can close this tab.</h1>")
 ```
 
-#### Token Lifecycle
-
-| Aspect | Behavior |
-|---|---|
-| **First request** | User must consent in browser (one-time per resource) |
-| **Subsequent requests** | Token retrieved from vault automatically — no user interaction |
-| **Token expiry** | AgentCore Identity uses the **refresh token** to obtain a new access token silently |
-| **Refresh token expiry** | User must re-consent in browser (typically 90+ days) |
-| **Per-user isolation** | Each user's tokens are stored separately and encrypted at rest |
-
-#### M2M vs USER_FEDERATION: When to Use Which
-
-| Scenario | Auth Flow | User Browser Needed? |
-|---|---|---|
-| Agent calls an internal API or database | `M2M` (Client Credentials) | No |
-| Agent reads *the user's own* Google Calendar | `USER_FEDERATION` (3LO) | Yes (for initial consent) |
-| Agent accesses a shared company Confluence | Depends — `M2M` for service account, `USER_FEDERATION` for per-user access | Depends |
-
-#### Repository Examples
-
-| Tutorial | Directory | What It Shows |
-|---|---|---|
-| Google Calendar 3LO | `01-tutorials/03-AgentCore-identity/05-Outbound_Auth_3lo/` | Full 3LO flow with Google Calendar |
-| GitHub OAuth | `01-tutorials/03-AgentCore-identity/06-Outbound_Auth_Github/` | 3LO with GitHub repos |
-| LinkedIn Auth Code Grant | `01-tutorials/02-AgentCore-gateway/13-outbound-auth-code-grant/` | Gateway + LinkedIn 3LO |
-| IDE Gateway + Atlassian | `01-tutorials/02-AgentCore-gateway/04-integration/03-ide-gateway-tool/` | VS Code + Confluence 3LO |
-
-#### FAQ: Common Questions About the 3LO Flow
-
-##### Q: Do I need to write and deploy a separate callback server?
-
-**Yes.** The callback server is **your responsibility** — AgentCore Identity does not provide a built-in callback endpoint. You need a server (or serverless function) that:
-
-1. Listens for the OAuth provider's redirect (e.g., `GET /oauth2/callback?session_id=...`)
-2. Calls `identity_client.complete_resource_token_auth()` to finalize the token exchange
-3. Shows the user a success page so they know they can return to the agent
-
-This is a lightweight component — typically 20–30 lines of route logic. The repo provides **copy-and-adapt sample implementations** for two deployment models:
+**Sample implementations in this repo:**
 
 | Deployment Model | Sample | When to Use |
 |---|---|---|
-| **Local FastAPI server** | `01-tutorials/03-AgentCore-identity/05-Outbound_Auth_3lo/oauth2_callback_server.py` | Development, Streamlit apps, SageMaker notebooks |
-| **AWS Lambda** | `01-tutorials/02-AgentCore-gateway/04-integration/03-ide-gateway-tool/lambda/callback_lambda.py` | Production cloud deployments behind API Gateway |
+| **Local FastAPI** | `01-tutorials/03-AgentCore-identity/05-Outbound_Auth_3lo/oauth2_callback_server.py` | Development, Streamlit, SageMaker |
+| **AWS Lambda** | `01-tutorials/02-AgentCore-gateway/04-integration/03-ide-gateway-tool/lambda/callback_lambda.py` | Production, behind API Gateway |
 
-You must also **register** the callback URL with your agent's workload identity so that AgentCore knows it's a legitimate redirect target:
+> **Why isn't the callback built into AgentCore?** The callback URL must be reachable by the user's browser *and* registered with the OAuth provider — it's part of *your* webapp's domain, not the AgentCore control plane. Different apps have different domains, ports, and deployment models.
 
-```python
-identity_client.update_workload_identity(
-    name=workload_name,
-    allowedResourceOauth2ReturnUrls=[
-        "http://localhost:9090/oauth2/callback",          # For local dev
-        # "https://your-domain.com/oauth2/callback",      # For production
-    ],
-)
-```
+### 5.6 Token Refresh: Who Does What?
 
-> **Why isn't the callback built into AgentCore?** Because the callback URL must be reachable by the user's browser *and* by the OAuth provider — it's part of *your* webapp's URL space, not the AgentCore control plane. Different apps have different domains, ports, and deployment models, so AgentCore leaves this to you.
-
-##### Q: On subsequent requests, does the agent call Identity Service to get the access token? Do I need to write that logic?
-
-**No — you don't need to write any token retrieval logic.** The `@requires_access_token` decorator handles this transparently.
-
-Here's what happens on each call to a tool decorated with `@requires_access_token`:
+**You never write refresh logic.** The `@requires_access_token` decorator handles all token lifecycle management for both flows.
 
 ```
 @requires_access_token called
         │
         ▼
-AgentCore Identity: Check token vault
-for this (user, resource, scope) tuple
+Check token vault for (user, resource, scope)
         │
-   ┌────┴─────┐
-   │           │
-Token found   No token
-   │           │
-   ▼           ▼
-Inject as     Generate OAuth auth URL
-access_token  → on_auth_url callback
-parameter     → user must consent in browser
+   ┌────┴──────────────────────┐
+   │              │              │
+No token      Token valid     Token expired
+   │              │              │
+   ▼              ▼              ▼
+(M2M)          Inject         (M2M) Re-fetch with
+Fetch with     immediately    client credentials
+client creds                  (3LO) Use refresh token
+   │                           to get new access token
+   ▼                           silently
+(3LO)                              │
+Trigger OAuth                      ▼
+flow → user                   Inject refreshed token
+must consent
 ```
 
-- **First call (no token in vault)**: The decorator triggers the OAuth flow — returns an authorization URL via the `on_auth_url` callback so the webapp can redirect the user to the consent screen.
-- **Subsequent calls (token exists)**: The decorator fetches the token from the AgentCore Identity token vault and **injects it directly** as the `access_token` parameter into your function. Your code simply uses it — no vault lookup or API call needed on your side.
-
-In your agent tool code, you just use the `access_token` parameter as if it magically appeared:
-
-```python
-async def get_calendar_events_today(access_token: Optional[str] = "") -> str:
-    # access_token is automatically populated by @requires_access_token
-    # You never call Identity Service yourself for this
-    creds = Credentials(token=access_token)
-    service = build("calendar", "v3", credentials=creds)
-    # ... use the API
-```
-
-##### Q: What if the access token expires? Who refreshes it?
-
-**AgentCore Identity handles token refresh automatically.** You do not need to write any refresh logic.
-
-When the OAuth provider issued tokens during the initial consent, it provided both an **access token** (short-lived, typically 1 hour) and a **refresh token** (long-lived, typically 90+ days). AgentCore Identity stores both in its encrypted token vault.
-
-```
-@requires_access_token called
-        │
-        ▼
-AgentCore Identity: Check token vault
-        │
-   ┌────┴──────────┐
-   │                │
-Token valid     Token expired
-   │                │
-   ▼                ▼
-Inject token    Use refresh token to get
-                new access token from
-                OAuth provider (silently)
-                        │
-                        ▼
-                Store new access token
-                in vault, inject it
-```
-
-| Scenario | What Happens | User Action Required? |
+| Scenario | M2M | USER_FEDERATION (3LO) |
 |---|---|---|
-| Access token is valid | Injected into your function immediately | **No** |
-| Access token expired, refresh token valid | AgentCore Identity silently calls the OAuth provider's token endpoint to get a new access token using the refresh token. Stores new token, injects it. | **No** |
-| Both tokens expired | `@requires_access_token` triggers a new OAuth flow — returns auth URL to user | **Yes** — user must re-consent in browser |
+| **No token yet** | Auto-fetches with client credentials — instant, no user action | Triggers OAuth flow — user must consent in browser (one-time) |
+| **Token valid** | Injected immediately | Injected immediately |
+| **Access token expired** | Re-fetches with client credentials — instant, automatic | Uses stored refresh token silently — no user action |
+| **Refresh token expired** | N/A (M2M doesn't use refresh tokens) | User must re-consent in browser (typically every 90+ days) |
 
-> **Important:** To get refresh tokens from the OAuth provider, you typically need to request the `offline_access` scope (or the provider's equivalent). Without it, you'll only get short-lived access tokens and users will need to re-authorize frequently.
+> **Tip:** To get refresh tokens from the OAuth provider, request the `offline_access` scope (or the provider's equivalent). Without it, you'll only get short-lived access tokens and users will need to re-authorize on every expiry.
 
-**Summary of responsibilities:**
+### 5.7 Summary of Responsibilities
 
-| Responsibility | Who Handles It |
-|---|---|
-| Writing the agent tool with `@requires_access_token` | **You (developer)** |
-| Writing and deploying the callback server | **You (developer)** |
-| Registering the OAuth provider (credential provider) | **You (developer, one-time setup)** |
-| Registering the callback URL in workload identity | **You (developer, one-time setup)** |
-| Storing tokens securely in the vault | **AgentCore Identity** |
-| Retrieving tokens on subsequent requests | **AgentCore Identity** (via `@requires_access_token`) |
-| Refreshing expired access tokens | **AgentCore Identity** (silently, using refresh token) |
-| Re-prompting user when refresh token expires | **AgentCore Identity** (via `@requires_access_token` → `on_auth_url`) |
+| Responsibility | M2M | USER_FEDERATION |
+|---|---|---|
+| Writing agent tool with `@requires_access_token` | **Developer** | **Developer** |
+| Registering the OAuth provider (credential provider) | **Developer** (one-time) | **Developer** (one-time) |
+| Creating a Workload Identity | **Developer** (one-time) | **Developer** (one-time) |
+| Writing and deploying the callback server | Not needed | **Developer** |
+| Registering callback URL in workload identity | Not needed | **Developer** (one-time) |
+| Storing tokens securely | **AgentCore Identity** | **AgentCore Identity** (per-user vault) |
+| Retrieving tokens on subsequent requests | **AgentCore Identity** (via decorator) | **AgentCore Identity** (via decorator) |
+| Refreshing expired access tokens | **AgentCore Identity** (re-fetches with client creds) | **AgentCore Identity** (uses refresh token silently) |
+| Re-prompting user when refresh token expires | N/A | **AgentCore Identity** (via `on_auth_url` callback) |
+
+### 5.8 Inbound Authentication (Clients → Your Agent)
+
+Separately from outbound tool auth, your agent's `/invocations` endpoint can be authenticated via:
+
+**AWS SigV4 (IAM Authentication):**
+
+```python
+from botocore.auth import SigV4Auth
+from botocore.awsrequest import AWSRequest
+
+aws_request = AWSRequest(method="POST", url=url, data=body, headers=headers)
+SigV4Auth(credentials, "bedrock-agentcore", region).add_auth(aws_request)
+```
+
+**JWT Token Extraction in Agent Runtime:**
+
+```python
+def _get_bearer_token(context) -> Optional[str]:
+    auth = (getattr(context, "request_headers", None) or {}).get("Authorization", "")
+    return auth[7:] if auth.startswith("Bearer ") else None
+```
+
+### Repository Examples
+
+| Example | Directory | Auth Flow |
+|---|---|---|
+| Customer Support (VPC) | `02-use-cases/customer-support-assistant-vpc/` | M2M for Gateway |
+| Device Management | `02-use-cases/device-management-agent/` | M2M for Gateway |
+| A2A Incident Response | `02-use-cases/A2A-multi-agent-incident-response/` | M2M for agent-to-agent |
+| AWS Operations Agent | `02-use-cases/AWS-operations-agent/` | M2M for Gateway |
+| Google Calendar 3LO | `01-tutorials/03-AgentCore-identity/05-Outbound_Auth_3lo/` | USER_FEDERATION |
+| GitHub OAuth | `01-tutorials/03-AgentCore-identity/06-Outbound_Auth_Github/` | USER_FEDERATION |
+| LinkedIn Auth Code | `01-tutorials/02-AgentCore-gateway/13-outbound-auth-code-grant/` | USER_FEDERATION via Gateway |
+| IDE + Confluence | `01-tutorials/02-AgentCore-gateway/04-integration/03-ide-gateway-tool/` | USER_FEDERATION |
 
 ### Blueprint Examples
 
@@ -470,6 +523,27 @@ Inject token    Use refresh token to get
 | Customer Service | `05-blueprints/end-to-end-customer-service-agent/` | Streamlit + FastAPI + AgentCore |
 | Customer Support | `05-blueprints/customer-support-agent-with-agentcore/` | Memory integration |
 | Shopping Concierge | `05-blueprints/shopping-concierge-agent/` | Shopping/cart tools |
+
+## 6. Typical Webapp Architecture
+
+For a travel agent exposed as a webapp, the architecture looks like:
+
+```
+Users (Browser) ──HTTP──▶ Your Webapp (Streamlit/React/FastAPI)
+                              │
+                              │ POST /runtimes/{arn}/invocations
+                              │ + Bearer Token + Session-Id header
+                              ▼
+                         AgentCore Runtime (your agent)
+                              │
+                              │ MCP (via Gateway)
+                              ▼
+                    Flight API, Hotel API, Google Calendar API
+```
+
+- **User ↔ Webapp**: Whatever protocol you choose (standard HTTP, WebSocket, etc.)
+- **Webapp ↔ Agent**: AWS HTTP REST API with JSON payloads, authenticated via OAuth2 (Cognito) or IAM SigV4
+- **Agent ↔ Tools**: MCP via AgentCore Gateway, authenticated via M2M or USER_FEDERATION (see [Section 5](#5-authentication-for-agent-tools))
 
 ## 7. Streaming & Async Responses
 
