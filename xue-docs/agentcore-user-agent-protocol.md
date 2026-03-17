@@ -347,6 +347,121 @@ async def handle_callback(session_id: str):
 | LinkedIn Auth Code Grant | `01-tutorials/02-AgentCore-gateway/13-outbound-auth-code-grant/` | Gateway + LinkedIn 3LO |
 | IDE Gateway + Atlassian | `01-tutorials/02-AgentCore-gateway/04-integration/03-ide-gateway-tool/` | VS Code + Confluence 3LO |
 
+#### FAQ: Common Questions About the 3LO Flow
+
+##### Q: Do I need to write and deploy a separate callback server?
+
+**Yes.** The callback server is **your responsibility** — AgentCore Identity does not provide a built-in callback endpoint. You need a server (or serverless function) that:
+
+1. Listens for the OAuth provider's redirect (e.g., `GET /oauth2/callback?session_id=...`)
+2. Calls `identity_client.complete_resource_token_auth()` to finalize the token exchange
+3. Shows the user a success page so they know they can return to the agent
+
+This is a lightweight component — typically 20–30 lines of route logic. The repo provides **copy-and-adapt sample implementations** for two deployment models:
+
+| Deployment Model | Sample | When to Use |
+|---|---|---|
+| **Local FastAPI server** | `01-tutorials/03-AgentCore-identity/05-Outbound_Auth_3lo/oauth2_callback_server.py` | Development, Streamlit apps, SageMaker notebooks |
+| **AWS Lambda** | `01-tutorials/02-AgentCore-gateway/04-integration/03-ide-gateway-tool/lambda/callback_lambda.py` | Production cloud deployments behind API Gateway |
+
+You must also **register** the callback URL with your agent's workload identity so that AgentCore knows it's a legitimate redirect target:
+
+```python
+identity_client.update_workload_identity(
+    name=workload_name,
+    allowedResourceOauth2ReturnUrls=[
+        "http://localhost:9090/oauth2/callback",          # For local dev
+        # "https://your-domain.com/oauth2/callback",      # For production
+    ],
+)
+```
+
+> **Why isn't the callback built into AgentCore?** Because the callback URL must be reachable by the user's browser *and* by the OAuth provider — it's part of *your* webapp's URL space, not the AgentCore control plane. Different apps have different domains, ports, and deployment models, so AgentCore leaves this to you.
+
+##### Q: On subsequent requests, does the agent call Identity Service to get the access token? Do I need to write that logic?
+
+**No — you don't need to write any token retrieval logic.** The `@requires_access_token` decorator handles this transparently.
+
+Here's what happens on each call to a tool decorated with `@requires_access_token`:
+
+```
+@requires_access_token called
+        │
+        ▼
+AgentCore Identity: Check token vault
+for this (user, resource, scope) tuple
+        │
+   ┌────┴─────┐
+   │           │
+Token found   No token
+   │           │
+   ▼           ▼
+Inject as     Generate OAuth auth URL
+access_token  → on_auth_url callback
+parameter     → user must consent in browser
+```
+
+- **First call (no token in vault)**: The decorator triggers the OAuth flow — returns an authorization URL via the `on_auth_url` callback so the webapp can redirect the user to the consent screen.
+- **Subsequent calls (token exists)**: The decorator fetches the token from the AgentCore Identity token vault and **injects it directly** as the `access_token` parameter into your function. Your code simply uses it — no vault lookup or API call needed on your side.
+
+In your agent tool code, you just use the `access_token` parameter as if it magically appeared:
+
+```python
+async def get_calendar_events_today(access_token: Optional[str] = "") -> str:
+    # access_token is automatically populated by @requires_access_token
+    # You never call Identity Service yourself for this
+    creds = Credentials(token=access_token)
+    service = build("calendar", "v3", credentials=creds)
+    # ... use the API
+```
+
+##### Q: What if the access token expires? Who refreshes it?
+
+**AgentCore Identity handles token refresh automatically.** You do not need to write any refresh logic.
+
+When the OAuth provider issued tokens during the initial consent, it provided both an **access token** (short-lived, typically 1 hour) and a **refresh token** (long-lived, typically 90+ days). AgentCore Identity stores both in its encrypted token vault.
+
+```
+@requires_access_token called
+        │
+        ▼
+AgentCore Identity: Check token vault
+        │
+   ┌────┴──────────┐
+   │                │
+Token valid     Token expired
+   │                │
+   ▼                ▼
+Inject token    Use refresh token to get
+                new access token from
+                OAuth provider (silently)
+                        │
+                        ▼
+                Store new access token
+                in vault, inject it
+```
+
+| Scenario | What Happens | User Action Required? |
+|---|---|---|
+| Access token is valid | Injected into your function immediately | **No** |
+| Access token expired, refresh token valid | AgentCore Identity silently calls the OAuth provider's token endpoint to get a new access token using the refresh token. Stores new token, injects it. | **No** |
+| Both tokens expired | `@requires_access_token` triggers a new OAuth flow — returns auth URL to user | **Yes** — user must re-consent in browser |
+
+> **Important:** To get refresh tokens from the OAuth provider, you typically need to request the `offline_access` scope (or the provider's equivalent). Without it, you'll only get short-lived access tokens and users will need to re-authorize frequently.
+
+**Summary of responsibilities:**
+
+| Responsibility | Who Handles It |
+|---|---|
+| Writing the agent tool with `@requires_access_token` | **You (developer)** |
+| Writing and deploying the callback server | **You (developer)** |
+| Registering the OAuth provider (credential provider) | **You (developer, one-time setup)** |
+| Registering the callback URL in workload identity | **You (developer, one-time setup)** |
+| Storing tokens securely in the vault | **AgentCore Identity** |
+| Retrieving tokens on subsequent requests | **AgentCore Identity** (via `@requires_access_token`) |
+| Refreshing expired access tokens | **AgentCore Identity** (silently, using refresh token) |
+| Re-prompting user when refresh token expires | **AgentCore Identity** (via `@requires_access_token` → `on_auth_url`) |
+
 ### Blueprint Examples
 
 | Blueprint | Directory | Description |
