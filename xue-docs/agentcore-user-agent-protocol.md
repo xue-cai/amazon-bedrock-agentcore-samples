@@ -127,9 +127,9 @@ client = MCPClient(
 )
 ```
 
-## 5. Authentication for Agent Tools
+## 5. Authentication
 
-When your agent calls external APIs or tools, it needs authentication tokens. AgentCore Identity provides a unified decorator — `@requires_access_token` — that works for both service-to-service and user-delegated scenarios. The underlying OAuth flow differs, but the developer experience is intentionally similar.
+When your agent calls external APIs or tools, it needs authentication tokens. AgentCore Identity provides a unified decorator — `@requires_access_token` — that works for both service-to-service and user-delegated scenarios. The underlying OAuth flow differs, but the developer experience is intentionally similar. (For inbound authentication — how clients authenticate *to* your agent — see [Section 5.8](#58-inbound-authentication-clients--your-agent).)
 
 | | **M2M (Service-to-Service)** | **USER_FEDERATION (User-Delegated)** |
 |---|---|---|
@@ -415,9 +415,11 @@ identity_client = IdentityClient(region="us-east-1")
 
 @app.get("/oauth2/callback")
 async def handle_callback(session_id: str):
+    # user_token_identifier: the user's Cognito JWT or unique ID,
+    # stored by your callback server when the OAuth flow began
     identity_client.complete_resource_token_auth(
         session_uri=session_id,
-        user_identifier=user_token_identifier  # Binds token to specific user
+        user_identifier=user_token_identifier
     )
     return HTMLResponse("<h1>Authorization successful! You can close this tab.</h1>")
 ```
@@ -543,7 +545,7 @@ Users (Browser) ──HTTP──▶ Your Webapp (Streamlit/React/FastAPI)
 
 - **User ↔ Webapp**: Whatever protocol you choose (standard HTTP, WebSocket, etc.)
 - **Webapp ↔ Agent**: AWS HTTP REST API with JSON payloads, authenticated via OAuth2 (Cognito) or IAM SigV4
-- **Agent ↔ Tools**: MCP via AgentCore Gateway, authenticated via M2M or USER_FEDERATION (see [Section 5](#5-authentication-for-agent-tools))
+- **Agent ↔ Tools**: MCP via AgentCore Gateway, authenticated via M2M or USER_FEDERATION (see [Section 5](#5-authentication))
 
 ## 7. Streaming & Async Responses
 
