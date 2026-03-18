@@ -188,6 +188,8 @@ If two users share a session ID, they would share the same container state — t
 
 ### Ephemeral Container State Does NOT Survive Redeployment
 
+> **Sourcing note**: The claim below is inferred from the general session–microVM model, not directly stated by AWS. See the [Evidence Assessment](./session-design-comparison.md#appendix-evidence-assessment-for-tight-session-compute-coupling) in the comparison doc for a confidence breakdown.
+
 When you deploy a new agent version, existing containers are terminated. Since a runtime session is backed by a container, the session dies with it. Key evidence:
 
 - **Container destruction on redeployment**: Existing microVMs are torn down when a new version is deployed
@@ -339,6 +341,8 @@ class AgentState(TypedDict):
 ---
 
 ## 8. Summary
+
+> **Sourcing note**: The characterization "Session = MicroVM" is an inference from AWS tutorial content that states "each session runs in its own microVM" — the tutorials describe sessions as running in microVMs, not as being identical to them. See the [Evidence Assessment](./session-design-comparison.md#appendix-evidence-assessment-for-tight-session-compute-coupling) for details.
 
 ```
 ┌───────────────────────────────────────────────────────┐

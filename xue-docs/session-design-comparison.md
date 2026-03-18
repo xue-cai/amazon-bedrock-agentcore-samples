@@ -21,6 +21,7 @@ This document compares two session models:
 4. [What Changes for Developers](#4-what-changes-for-developers)
 5. [Migration Implications](#5-migration-implications)
 6. [Open Questions](#6-open-questions)
+7. [Appendix: Evidence Assessment for Tight Session-Compute Coupling](#appendix-evidence-assessment-for-tight-session-compute-coupling)
 
 ---
 
@@ -326,3 +327,69 @@ Model B's explicit "in-memory state is never guaranteed" is a **breaking behavio
 | **External memory** | AgentCore Memory (well-defined) | Unclear relationship | Needs clarification |
 
 **Bottom line**: Model B is a more principled architecture — sessions as durable workflows is the right long-term abstraction. However, it introduces a breaking change in developer expectations (no more implicit in-memory persistence) and leaves several integration questions open (Memory service, Tool sessions, framework support).
+
+---
+
+## Appendix: Evidence Assessment for Tight Session-Compute Coupling
+
+This document characterizes the current AgentCore session model as having "tight session–compute coupling" (session IS the container). This appendix distinguishes between what AWS sources directly state versus what was inferred, and flags where the claim could be challenged.
+
+### Directly Stated by AWS (Primary Sources)
+
+The following facts come from the AWS-authored tutorial notebook at [`01-tutorials/.../02-understanding-runtime-context/understanding_runtime_context.ipynb`](../01-tutorials/01-AgentCore-runtime/03-advanced-concepts/02-understanding-runtime-context/understanding_runtime_context.ipynb):
+
+| Claim | Source (notebook cell) | Exact Quote |
+|---|---|---|
+| Each session runs in a dedicated microVM | Cell 1 (Prerequisites) | "Each session runs in its own microVM with isolated CPU, memory, and filesystem" |
+| In-memory state persists across invocations | Cell 1 (Context Persistence) | "Within a session, AgentCore Runtime maintains: Conversation History, Application State, File System, Environment Variables" |
+| Session termination destroys the microVM and sanitizes memory | Cell 1 (Isolation and Security) | "After session completion, the microVM is terminated and memory is sanitized" |
+| Sessions are ephemeral — not for permanent storage | Cell 1 (Best Practices) | "Ephemeral Nature: Don't rely on sessions for permanent data storage (use AgentCore Memory for persistence)" |
+| Session lifecycle has no "resume" step | Cell 1 (Session Lifecycle) | "1. Creation → 2. Active → 3. Idle → 4. Termination: Session ends due to: Inactivity (15 min), Maximum lifetime (8 hrs), Health check failures" |
+| Context is lost on new session ID | Cell 18 (Session Isolation results) | Demonstrated: new session ID → completely isolated environment, no access to prior state |
+
+### Inferred (Not Directly Stated)
+
+The following claims are **inferences** built on the above facts. They are reasonable characterizations of observed behavior but are not explicitly stated by AWS:
+
+| Inference | Reasoning | Confidence |
+|---|---|---|
+| **"Session = container"** (identity equivalence) | The tutorial says sessions *run in* microVMs and are *terminated with* microVMs. The lifecycle has no separation between session termination and compute termination. But the tutorial never uses the phrase "a session IS a container." | **Medium-High** |
+| **Sessions die on redeployment** | The lifecycle doc at [`session-lifecycle.md` §5](./session-lifecycle.md#5-sessions-across-agent-versions-and-deployments) lists redeployment as a termination cause. This is inferred from: (a) containers are terminated on new version deploy, (b) session is backed by a container, therefore (c) session dies. No AWS doc was found that explicitly states this. | **Medium** |
+| **No session migration API** | Inferred from absence — no such API appears in the SDK, docs, or samples. Absence of evidence is not evidence of absence. | **Medium** |
+| **Session routing = container affinity** | The tutorial shows that same session ID → same execution context with preserved state, which is consistent with container affinity. But the mechanism ("routing") is inferred, not described. | **Medium-High** |
+
+### Where the Claim Could Be Challenged
+
+1. **"Runs in" ≠ "Is"**: The tutorial says "each session runs in its own microVM" — which could be read as sessions being *backed by* microVMs rather than *being identical to* microVMs. If AWS were to introduce a durable layer beneath the microVM (as Model B proposes), the current tutorial language would not actually contradict it.
+
+2. **Describing behavior, not contract**: The tutorial may be describing the current runtime's *observable behavior* rather than the intended *architectural contract*. It's possible sessions are already abstractly separate from compute in the platform's internal model, but the current implementation happens not to persist state across sandbox restarts.
+
+3. **Redeployment behavior is underdocumented**: The claim that sessions die on redeployment is inferred from the general container termination model. AWS could implement rolling deployments or session draining without contradicting any currently published documentation.
+
+### The Inference Chain
+
+For transparency, the "tight coupling" characterization follows this logic:
+
+```
+Premise 1: Each session runs in its own microVM               (stated)
+Premise 2: In-memory state persists across invocations         (stated & demonstrated)
+Premise 3: Session termination = microVM termination + cleanup (stated)
+Premise 4: No resume-after-termination step in lifecycle       (observed absence)
+Premise 5: "Don't rely on sessions for permanent storage"      (stated)
+─────────────────────────────────────────────────────────────────────
+Conclusion: Session lifecycle is bound to compute lifecycle    (inferred)
+```
+
+### Confidence Summary
+
+| Aspect | Confidence | Evidence Type |
+|---|---|---|
+| Sessions run in dedicated microVMs | **High** | Directly stated |
+| In-memory state persists within a session | **High** | Stated and demonstrated |
+| Session termination destroys all state | **High** | Directly stated ("memory sanitized") |
+| No built-in durable session storage | **High** | Stated ("don't rely on sessions for permanent storage") |
+| No resume-after-termination | **Medium-High** | Inferred from lifecycle description (no resume step) |
+| Sessions die on redeployment | **Medium** | Inferred (not directly stated anywhere) |
+| "Session = container" as architectural identity | **Medium** | Inferred from behavioral descriptions |
+
+**Recommendation**: When discussing the tight-coupling model with AWS stakeholders, lead with the high-confidence directly-stated facts (sessions run in microVMs, state is ephemeral, no built-in durability) and present the equivalence claim ("session IS the container") as a reasonable interpretation of current behavior rather than a documented architectural guarantee.
