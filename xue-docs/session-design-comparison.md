@@ -1,4 +1,4 @@
-# Session Design Comparison: Current AgentCore vs Hosted Agents Proposal vs OpenClaw
+# Session Design Comparison: AgentCore, Hosted Agents, and OpenClaw
 
 This document compares three session models:
 
@@ -33,7 +33,7 @@ The three models disagree on what a session **is**:
 
 | | Current AgentCore (Model A) | Hosted Agents Proposal (Model B) | OpenClaw (Model C) |
 |---|---|---|---|
-| **Session =** | A microVM / container | A logical, durable execution context | A routed conversation bucket with append-only transcript |
+| **Session =** | A microVM / container | A logical, durable execution context | A routing namespace backed by an append-only transcript file |
 | **Compute =** | The session itself | An ephemeral implementation detail | A single Gateway process (not per-session compute) |
 | **Analogy** | A session is a pet (you care for it, when it dies it's gone) | A session is a workflow (it outlives any single executor) | A session is a journal (append-only log that can be compacted but never lost) |
 
@@ -127,7 +127,7 @@ sessionKey: agent:my-agent:main
 → Old transcript file is retained on disk
 ```
 
-**Impact**: Model C takes a fundamentally different approach from both A and B — it decouples session persistence from compute entirely by treating sessions as files, not processes. There is no sandbox, container, or microVM per session. The Gateway reads from disk, sends context to the model API, and appends the response. This makes sessions inherently durable (as durable as the filesystem) but means context must fit within the model's context window, which is managed via compaction.
+**Impact**: Model C takes a fundamentally different approach from both A and B — it decouples session persistence from compute entirely by treating sessions as files, not processes. There is no sandbox, container, or microVM per session. The Gateway reads from disk, sends context to the model API, and appends the response. This makes sessions inherently durable (as durable as the filesystem), but context must fit within the model's context window. Model C addresses this via compaction — summarizing older turns to stay within bounds.
 
 ### 3.2 Durability and State Persistence
 
@@ -218,7 +218,7 @@ First message → sessionKey created → sessionId assigned → Active (turns ap
 
 The critical difference is that Model B has a **resume** step that Model A lacks. In Model A, idle → timeout → destroyed is one-way. In Model B, idle → sandbox terminated, but session remains, and a new request triggers a new sandbox with durable state reattached.
 
-Model C takes yet another approach: there is no "resume" because there is nothing to resume — sessions are files, not processes. An idle timeout in Model C doesn't destroy or suspend anything; it simply means the next message starts a **new transcript** under the same routing key. The old transcript remains on disk indefinitely (subject to disk-budget maintenance). This means Model C never "loses" a conversation — it just starts a new chapter.
+Model C takes yet another approach: there is no "resume" because there is nothing to resume — sessions are files, not processes. An idle timeout in Model C doesn't destroy or suspend anything; it simply means the next message starts a **new transcript** under the same routing key. The old transcript remains on disk subject to configured retention policies (disk-budget maintenance may eventually archive or remove old transcripts).
 
 **Implication for the samples in this repo**: The SRE Agent currently resets `session_id` after saving an investigation report ([multi_agent_langgraph.py](../02-use-cases/SRE-agent/sre_agent/multi_agent_langgraph.py)). Under Model B, this reset would still create a new logical session, but the old session would remain alive (in idle/expired state) rather than being immediately destroyed.
 
@@ -291,7 +291,7 @@ Session (transcript-backed)
          └── memory/YYYY-MM-DD.md    ← dated memory entries
 ```
 
-In Model C, the **pre-compaction memory flush** is a key innovation: before auto-compaction summarizes and compresses older turns, the Gateway triggers a silent agentic turn where the model writes important facts to workspace memory files. This ensures critical context survives compaction even if the compaction summary is lossy. The memory files are regular files in the agent workspace — not a separate service.
+In Model C, the **pre-compaction memory flush** is a key innovation: before auto-compaction summarizes and compresses older turns, the Gateway triggers a silent agentic turn (an automated agent invocation not visible to the user) where the model writes important facts to workspace memory files. This ensures critical context survives compaction even if the compaction summary is lossy. The memory files are regular files in the agent workspace — not a separate service.
 
 **Cross-model comparison**:
 
@@ -337,7 +337,7 @@ This is a dimension where Model C introduces a concept absent from both Models A
 }
 ```
 
-**Lesson for Models A and B**: Any production session model will eventually need a compaction-like mechanism. Model A's approach (state dies with the container) sidesteps the problem but at a high cost. Model B's session storage could store conversation history but doesn't describe how to manage its growth. Model C's approach — append-only transcripts with periodic compaction — is a pattern worth considering for both.
+**Lesson for Models A and B**: Any production session model will likely need a compaction-like mechanism. Model A's approach (state dies with the container) sidesteps the problem but at a high cost. Model B's session storage could store conversation history but doesn't describe how to manage its growth. Model C's approach — append-only transcripts with periodic compaction — is a pattern worth considering for both.
 
 ---
 
@@ -454,7 +454,7 @@ Model B's explicit "in-memory state is never guaranteed" is a **breaking behavio
 
 **Bottom line**: Model B is a more principled architecture than Model A — sessions as durable workflows is the right long-term abstraction. However, it introduces a breaking change in developer expectations (no more implicit in-memory persistence) and leaves several integration questions open (Memory service, Tool sessions, framework support).
 
-Model C (OpenClaw) offers a compelling third perspective: **sessions as append-only files**. This approach achieves durability by default (no checkpointing needed), handles context window limits via compaction, and integrates memory as workspace files rather than a separate service. Its main limitation is the lack of compute isolation (single Gateway process, no per-session sandboxing), making it unsuitable for multi-tenant cloud platforms. However, its compaction mechanism and pre-compaction memory flush are patterns that Models A and B should consider adopting.
+Model C (OpenClaw) offers a compelling third perspective: **sessions as append-only files**. This approach achieves durability by default (no checkpointing needed), handles context window limits via compaction, and integrates memory as workspace files rather than a separate service. Its current implementation lacks compute isolation (single Gateway process, no per-session sandboxing), which limits its applicability for multi-tenant cloud platforms — though the underlying architectural pattern (append-only transcripts with compaction) could be adapted with database backing for cloud-scale deployments. Its compaction mechanism and pre-compaction memory flush are patterns that Models A and B should consider adopting.
 
 ---
 
