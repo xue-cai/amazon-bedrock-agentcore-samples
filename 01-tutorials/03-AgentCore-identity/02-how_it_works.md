@@ -56,4 +56,195 @@ The AgentCore Identity workflow consists of the following steps:
 
 **Process completes (Done)** — The workflow concludes with all tokens properly managed, audit logs recorded, and the user's request fulfilled. The system maintains security throughout the process while providing a seamless experience for users who want to leverage AI agents to access and manipulate their data across multiple services and platforms.
 
-This workflow is built on several key technical principles that distinguish AgentCore Credential Provider from traditional authentication approaches. The service implements zero trust security, where every request is validated regardless of source or previous trust relationships. It uses delegation-based authentication rather than impersonation, ensuring that agents always authenticate as themselves while carrying user context. The service is MCP (Model Context Protocol) compliant, supporting standard protocols for agent-to-tool communication. Finally, it provides cross-platform support, enabling agents to operate across AWS, other cloud providers, and on-premise environments while maintaining consistent security standards. 
+This workflow is built on several key technical principles that distinguish AgentCore Credential Provider from traditional authentication approaches. The service implements zero trust security, where every request is validated regardless of source or previous trust relationships. It uses delegation-based authentication rather than impersonation, ensuring that agents always authenticate as themselves while carrying user context. The service is MCP (Model Context Protocol) compliant, supporting standard protocols for agent-to-tool communication. Finally, it provides cross-platform support, enabling agents to operate across AWS, other cloud providers, and on-premise environments while maintaining consistent security standards.
+
+---
+
+## End-to-End Auth Flow: From User Login to Tool Execution
+
+This section traces the complete authentication flow through actual code, answering a common question: *"The webapp authenticates the user, gets a JWT, extracts the user_id… but how does `@requires_access_token` know which user's token to fetch if it doesn't take a `user_id` parameter?"*
+
+### The Two Channels for User Identity
+
+User identity flows through the system via **two separate channels**:
+
+| Channel | What it carries | How it's passed | Used by |
+|---------|----------------|-----------------|---------|
+| **Explicit** | `actor_id` (e.g., `cognito:username`) | In the HTTP request payload, threaded through function parameters | Memory (per-user conversation history), application logic |
+| **Implicit** | User's JWT → **Workload Access Token** | In the `Authorization` header → token exchange by Runtime → stored in SDK runtime context | `@requires_access_token` decorator (token vault lookups) |
+
+The `@requires_access_token` decorator uses the **implicit** channel. It never needs a `user_id` parameter because the AgentCore Runtime has already exchanged the user's inbound JWT for a **Workload Access Token (WAT)** that encodes both the agent's identity and the user's identity. The SDK stores this WAT in an internal runtime context, and the decorator reads it automatically.
+
+### Complete Flow Diagram
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  PHASE 1: USER AUTHENTICATION (Webapp ↔ Cognito)                           │
+│                                                                             │
+│  ┌──────────┐     1. Redirect to Cognito      ┌──────────────────┐         │
+│  │  User's   │────── login page (PKCE) ──────▶│  Amazon Cognito   │         │
+│  │  Browser  │                                 │  (OAuth2/OIDC)    │         │
+│  │           │◀──── 2. Authorization code ─────│                   │         │
+│  └─────┬─────┘                                 └────────┬──────────┘         │
+│        │                                                │                    │
+│        │  3. Code + code_verifier                       │                    │
+│        ▼                                                │                    │
+│  ┌──────────────┐   4. Exchange code ──────────────────▶│                    │
+│  │  Webapp       │      for tokens                       │                    │
+│  │  (Streamlit)  │◀──── 5. id_token + access_token ─────┘                    │
+│  │               │                                                           │
+│  │  auth.py:     │   6. Decode id_token (no sig verify)                      │
+│  │  get_user_    │      → user_claims = {                                    │
+│  │  claims()     │          "cognito:username": "alice",                      │
+│  │               │          "email": "alice@acme.com", ...                    │
+│  │               │        }                                                  │
+│  └───────┬───────┘                                                           │
+│          │                                                                   │
+└──────────┼───────────────────────────────────────────────────────────────────┘
+           │
+           │  PHASE 2: AGENT INVOCATION (Webapp → AgentCore Runtime)
+           │
+           │  chat.py builds the HTTP request:
+           │
+           │  POST /runtimes/{agent_arn}/invocations
+           │  Headers:
+           │    Authorization: Bearer <cognito_access_token>  ← IMPLICIT channel
+           │    X-Amzn-Bedrock-AgentCore-Runtime-Session-Id: <uuid>
+           │  Body:
+           │    {"prompt": "Show my calendar",
+           │     "actor_id": "alice"}                         ← EXPLICIT channel
+           │
+           ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  PHASE 3: RUNTIME PROCESSES THE REQUEST                                     │
+│                                                                             │
+│  ┌──────────────────────────────────────────────┐                           │
+│  │  AgentCore Runtime                            │                           │
+│  │                                               │                           │
+│  │  7. Validates Bearer JWT (signature, expiry,  │                           │
+│  │     issuer, audience, scopes)                 │                           │
+│  │                                               │                           │
+│  │  8. Token Exchange: JWT → Workload Access     │                           │
+│  │     Token (WAT) via AgentCore Identity API    │──────┐                    │
+│  │     WAT encodes: agent identity + user        │      │                    │
+│  │     identity (from the validated JWT)         │      │                    │
+│  │                                               │      ▼                    │
+│  │  9. Stores WAT in SDK runtime context         │  ┌────────────────┐      │
+│  │     (Python contextvars / thread-local)       │  │ AgentCore      │      │
+│  │                                               │  │ Identity       │      │
+│  │  10. Calls @app.entrypoint:                   │  │ Service        │      │
+│  │      invoke(payload, context)                 │  │                │      │
+│  │        → payload["actor_id"] = "alice"        │  │ Validates JWT  │      │
+│  │        → context.session_id = <from header>   │  │ Issues WAT     │      │
+│  └──────────────────┬───────────────────────────┘  └────────────────┘      │
+│                     │                                                       │
+└─────────────────────┼───────────────────────────────────────────────────────┘
+                      │
+                      │  PHASE 4: AGENT EXECUTION
+                      │
+                      │  main.py → agent_task.py:
+                      │
+                      │  11. get_gateway_access_token()
+                      │      → @requires_access_token(auth_flow="M2M")
+                      │      → reads WAT from implicit context
+                      │      → AgentCore Identity returns service token
+                      │
+                      │  12. MemoryHook(actor_id="alice", session_id=...)
+                      │      → uses EXPLICIT actor_id for per-user memory
+                      │
+                      │  13. Agent processes user message with LLM
+                      │      → LLM decides to call a tool
+                      │
+                      ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  PHASE 5: TOOL CALLS @requires_access_token                                 │
+│                                                                             │
+│  google.py — get_google_access_token():                                     │
+│                                                                             │
+│  @requires_access_token(                                                    │
+│      provider_name="acme-google-calendar",                                  │
+│      scopes=["...calendar"],                                                │
+│      auth_flow="USER_FEDERATION",  ← 3-Legged OAuth                        │
+│      on_auth_url=on_auth_url,                                               │
+│  )                                                                          │
+│  def get_google_access_token(access_token: str):                            │
+│      return access_token                                                    │
+│                                                                             │
+│  ┌─────────────────────────────────────────────────────┐                    │
+│  │  Inside the decorator (SDK internals):               │                    │
+│  │                                                      │                    │
+│  │  14. Read WAT from runtime context                   │                    │
+│  │      (WAT contains agent identity + user identity)   │                    │
+│  │                                                      │                    │
+│  │  15. Call AgentCore Identity:                         │                    │
+│  │      "Give me a Google Calendar token for             │                    │
+│  │       (this agent, this user, these scopes)"          │                    │
+│  │                                                      │                    │
+│  │  16a. Token found in vault?                          │                    │
+│  │       → Return it → injected as access_token param   │                    │
+│  │                                                      │                    │
+│  │  16b. No token? (first time for this user+resource)  │                    │
+│  │       → AgentCore Identity returns an auth URL        │                    │
+│  │       → Decorator calls on_auth_url(url)              │                    │
+│  │       → Webapp shows URL to user                      │                    │
+│  │       → User consents in browser                      │                    │
+│  │       → Callback server calls                         │                    │
+│  │         complete_resource_token_auth()                 │                    │
+│  │       → Token stored in vault per (agent, user,       │                    │
+│  │         provider, scopes)                              │                    │
+│  │       → On retry, token is found and injected          │                    │
+│  └──────────────────────────────────────────────────────┘                    │
+│                                                                             │
+│  17. Tool uses the injected access_token to call                            │
+│      Google Calendar API → returns Alice's events                           │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Why `@requires_access_token` Doesn't Need a `user_id` Parameter
+
+Looking at the decorator signature:
+
+```python
+@requires_access_token(
+    provider_name: str,           # Which OAuth provider (e.g., "google-cal-provider")
+    scopes: List[str],            # OAuth scopes needed
+    auth_flow: "M2M" | "USER_FEDERATION",
+    on_auth_url: Callable,        # Callback when user consent is needed
+    into: str = "access_token",   # Parameter name to inject token into
+    force_authentication: bool,
+    callback_url: str,            # OAuth redirect URI
+)
+```
+
+There is no `user_id` parameter. The user's identity is already embedded in the **Workload Access Token (WAT)** that the AgentCore Runtime created during Phase 3 (step 8). The SDK stores this WAT in an internal runtime context that the decorator reads automatically. This is by design:
+
+- **Separation of concerns**: Authentication (proving identity) is handled at the Runtime level during request processing. Tool code doesn't need to thread user IDs through every function call.
+- **Security**: The user identity comes from a cryptographically validated JWT → WAT chain, not from an easily-spoofable function parameter.
+- **Simplicity**: Tool developers only need to declare *what resource* they need (`provider_name`, `scopes`) and *what type of access* (`auth_flow`). The decorator handles the rest.
+
+### The `actor_id` vs. WAT Distinction
+
+| | `actor_id` (Explicit) | Workload Access Token (Implicit) |
+|---|---|---|
+| **Source** | Extracted from JWT claims in webapp code | Created by Runtime via token exchange |
+| **Passed via** | HTTP payload → function parameters | SDK runtime context (automatic) |
+| **Contains** | A string identifier (e.g., `"alice"`) | Cryptographic proof of agent + user identity |
+| **Used by** | Memory (per-user history), app logic | `@requires_access_token` (token vault lookups) |
+| **Security model** | Application-level (trusts the webapp) | Zero-trust (validated by AgentCore Identity) |
+
+Both carry the user's identity, but through different mechanisms for different purposes. The `actor_id` is a convenience for application-level features like memory namespacing. The WAT is a security primitive that enables the decorator to request per-user tokens without the developer explicitly passing user identity.
+
+### Code References
+
+The complete flow can be traced through the [customer-support-assistant](../../02-use-cases/customer-support-assistant/) sample:
+
+| Step | File | Key Code |
+|------|------|----------|
+| User login (PKCE) | `app_modules/auth.py` | `AuthManager.handle_oauth_callback()` — exchanges auth code for JWT tokens |
+| Extract user claims | `app_modules/auth.py` | `get_user_claims()` — decodes `id_token` to get `cognito:username` |
+| Build invocation request | `app_modules/chat.py` | `invoke_endpoint()` — sends Bearer token + `actor_id` in payload |
+| Runtime entrypoint | `main.py` | `invoke(payload, context)` — extracts `actor_id` and `session_id` |
+| M2M token for Gateway | `agent_config/access_token.py` | `@requires_access_token(auth_flow="M2M")` — gets service token |
+| Memory with user scope | `agent_config/agent_task.py` | `MemoryHook(actor_id=actor_id)` — per-user conversation history |
+| User-delegated Google token | `agent_config/tools/google.py` | `@requires_access_token(auth_flow="USER_FEDERATION")` — gets Alice's Google token | 
