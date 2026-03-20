@@ -736,6 +736,106 @@ The complete flow can be traced through the [customer-support-assistant](../02-u
 | Memory with user scope | `agent_config/agent_task.py` | `MemoryHook(actor_id=actor_id)` — per-user conversation history |
 | User-delegated Google token | `agent_config/tools/google.py` | `@requires_access_token(auth_flow="USER_FEDERATION")` — gets Alice's Google token |
 
+### 7.6 FAQ: Who Sends the `session_id`? When Is It Created vs. Reused?
+
+**The webapp creates and manages the session ID — not the browser directly and not AgentCore Runtime.**
+
+In the customer-support-assistant sample, the Streamlit webapp generates a fresh UUID on first page load and stores it in Streamlit's session state:
+
+```python
+# app_modules/chat.py — _init_session_state()
+if "session_id" not in st.session_state:
+    st.session_state["session_id"] = str(uuid.uuid4())   # ← New UUID per browser tab
+```
+
+Every subsequent message in the same browser tab reuses this value, which is sent as a header:
+
+```python
+# app_modules/chat.py — invoke_endpoint()
+headers = {
+    "Authorization": f"Bearer {bearer_token}",
+    "X-Amzn-Bedrock-AgentCore-Runtime-Session-Id": session_id,   # ← Same UUID throughout
+}
+```
+
+| Event | What happens to `session_id` |
+|-------|------------------------------|
+| **User opens a new browser tab** | Webapp generates a fresh `uuid.uuid4()` → new session |
+| **User sends another message in the same tab** | Webapp reuses `st.session_state["session_id"]` → same container |
+| **Container times out** (15-min idle / 8-hr max) | Next request with the same `session_id` creates a new container — all in-memory state is lost, but AgentCore Memory persists |
+| **User refreshes the page** (Streamlit) | `st.session_state` resets → new UUID → new session |
+
+**Key point**: The `session_id` is opaque to AgentCore — the platform does no user-binding validation. Whoever sends the same session ID header is routed to the same container. It is the **webapp's responsibility** to generate unique, per-user session IDs (which the sample does via `uuid.uuid4()`).
+
+For a deeper treatment of session lifecycle, see [session-lifecycle.md](./session-lifecycle.md).
+
+### 7.7 FAQ: What If `actor_id` Is Missing or Wrong?
+
+#### If `actor_id` is missing from the request body
+
+The agent entrypoint crashes with a `KeyError`:
+
+```python
+# main.py — invoke()
+actor_id = payload["actor_id"]   # ← KeyError if key is absent
+```
+
+There is no graceful fallback — this is a hard crash. A production webapp should always extract `actor_id` from the validated JWT claims before calling `/invocations`.
+
+#### If `actor_id` is wrong (e.g., `"bob"` instead of `"alice"`)
+
+**Yes — the agent will retrieve and write to the wrong user's memory.** There is no platform-level validation that `actor_id` matches the authenticated user's JWT.
+
+Memory is namespaced by `actor_id` via direct string interpolation:
+
+```python
+# agent_config/memory_hook_provider.py
+namespace=f"support/user/{self.actor_id}/preferences"   # ← Whatever string was passed
+namespace=f"support/user/{self.actor_id}/facts"
+```
+
+And conversation history is scoped by the `(memory_id, actor_id, session_id)` tuple:
+
+```python
+# agent_config/memory_hook_provider.py — on_agent_initialized()
+recent_turns = self.memory_client.get_last_k_turns(
+    memory_id=self.memory_id,
+    actor_id=self.actor_id,      # ← Any string — no validation
+    session_id=self.session_id,
+    k=5,
+)
+```
+
+If the webapp has a bug and sends `"actor_id": "bob"` with Alice's valid JWT:
+1. ✅ Alice's JWT is validated (she's authorized to call the agent)
+2. ❌ The agent loads **Bob's** conversation history, preferences, and facts
+3. ❌ Alice's conversation is saved **under Bob's** namespace
+4. → **Cross-user memory contamination and disclosure**
+
+#### Why the current sample is safe *in practice*
+
+The webapp extracts `actor_id` directly from the validated JWT — never from user input:
+
+```python
+# app_modules/chat.py
+payload = json.dumps({
+    "prompt": prompt,
+    "actor_id": user_claims.get("cognito:username")   # ← From decoded id_token
+})
+```
+
+A bug would have to be introduced in this webapp code path to send the wrong value.
+
+#### Why `@requires_access_token` is NOT affected
+
+The `@requires_access_token` decorator uses the **implicit** identity channel (Workload Access Token), not the explicit `actor_id`. Even if `actor_id` is wrong, the WAT still carries the real user's cryptographically validated identity. So tool access (e.g., Google Calendar) always resolves to the correct user — only **Memory** is affected by a wrong `actor_id`.
+
+| Concern | `actor_id` (Explicit) | WAT (Implicit) |
+|---------|----------------------|----------------|
+| Can a webapp bug cause cross-user access? | ⚠️ **Yes** — Memory reads/writes use the string as-is | ✅ **No** — cryptographically bound to the validated JWT |
+| Platform validates it? | ❌ No | ✅ Yes (JWT → token exchange → WAT) |
+| Mitigation | Webapp must extract from JWT; never accept from client input | Built-in — no developer action needed |
+
 ## 8. Streaming & Async Responses
 
 Agents support streaming by yielding events from the entrypoint:
