@@ -547,7 +547,298 @@ Users (Browser) ──HTTP──▶ Your Webapp (Streamlit/React/FastAPI)
 - **Webapp ↔ Agent**: AWS HTTP REST API with JSON payloads, authenticated via OAuth2 (Cognito) or IAM SigV4
 - **Agent ↔ Tools**: MCP via AgentCore Gateway, authenticated via M2M or USER_FEDERATION (see [Section 5](#5-authentication))
 
-## 7. Streaming & Async Responses
+## 7. End-to-End Auth Flow: From User Login to Tool Execution
+
+This section traces the complete authentication flow through actual code, answering a common question: *"The webapp authenticates the user, gets a JWT, extracts the user_id… but how does `@requires_access_token` know which user's token to fetch if it doesn't take a `user_id` parameter?"*
+
+### 7.1 The Two Channels for User Identity
+
+User identity flows through the system via **two separate channels**:
+
+| Channel | What it carries | How it's passed | Used by |
+|---------|----------------|-----------------|---------|
+| **Explicit** | `actor_id` (e.g., `cognito:username`) | In the HTTP request payload, threaded through function parameters | Memory (per-user conversation history), application logic |
+| **Implicit** | User's JWT → **Workload Access Token** | In the `Authorization` header → token exchange by Runtime → stored in SDK runtime context | `@requires_access_token` decorator (token vault lookups) |
+
+The `@requires_access_token` decorator uses the **implicit** channel. It never needs a `user_id` parameter because the AgentCore Runtime has already exchanged the user's inbound JWT for a **Workload Access Token (WAT)** that encodes both the agent's identity and the user's identity. The SDK stores this WAT in an internal runtime context, and the decorator reads it automatically.
+
+### 7.2 Complete Flow Diagram
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  PHASE 1: USER AUTHENTICATION (Webapp ↔ Cognito)                           │
+│                                                                             │
+│  ┌──────────┐     1. Redirect to Cognito      ┌──────────────────┐         │
+│  │  User's   │────── login page (PKCE) ──────▶│  Amazon Cognito   │         │
+│  │  Browser  │                                 │  (OAuth2/OIDC)    │         │
+│  │           │◀──── 2. Authorization code ─────│                   │         │
+│  └─────┬─────┘                                 └────────┬──────────┘         │
+│        │                                                │                    │
+│        │  3. Code + code_verifier                       │                    │
+│        ▼                                                │                    │
+│  ┌──────────────┐   4. Exchange code ──────────────────▶│                    │
+│  │  Webapp       │      for tokens                       │                    │
+│  │  (Streamlit)  │◀──── 5. id_token + access_token ─────┘                    │
+│  │               │                                                           │
+│  │  auth.py:     │   6. Decode id_token (no sig verify)                      │
+│  │  get_user_    │      → user_claims = {                                    │
+│  │  claims()     │          "cognito:username": "alice",                      │
+│  │               │          "email": "alice@acme.com", ...                    │
+│  │               │        }                                                  │
+│  └───────┬───────┘                                                           │
+│          │                                                                   │
+└──────────┼───────────────────────────────────────────────────────────────────┘
+           │
+           │  PHASE 2: AGENT INVOCATION (Webapp → AgentCore Runtime)
+           │
+           │  chat.py builds the HTTP request:
+           │
+           │  POST /runtimes/{agent_arn}/invocations
+           │  Headers:
+           │    Authorization: Bearer <cognito_access_token>  ← IMPLICIT channel
+           │    X-Amzn-Bedrock-AgentCore-Runtime-Session-Id: <uuid>
+           │  Body:
+           │    {"prompt": "Show my calendar",
+           │     "actor_id": "alice"}                         ← EXPLICIT channel
+           │
+           ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  PHASE 3: RUNTIME PROCESSES THE REQUEST                                     │
+│                                                                             │
+│  ┌──────────────────────────────────────────────┐                           │
+│  │  AgentCore Runtime                            │                           │
+│  │                                               │                           │
+│  │  7. Validates Bearer JWT (signature, expiry,  │                           │
+│  │     issuer, audience, scopes)                 │                           │
+│  │                                               │                           │
+│  │  8. Token Exchange: JWT → Workload Access     │                           │
+│  │     Token (WAT) via AgentCore Identity API    │──────┐                    │
+│  │     WAT encodes: agent identity + user        │      │                    │
+│  │     identity (from the validated JWT)         │      │                    │
+│  │                                               │      ▼                    │
+│  │  9. Stores WAT in SDK runtime context         │  ┌────────────────┐      │
+│  │     (Python contextvars / thread-local)       │  │ AgentCore      │      │
+│  │                                               │  │ Identity       │      │
+│  │  10. Calls @app.entrypoint:                   │  │ Service        │      │
+│  │      invoke(payload, context)                 │  │                │      │
+│  │        → payload["actor_id"] = "alice"        │  │ Validates JWT  │      │
+│  │        → context.session_id = <from header>   │  │ Issues WAT     │      │
+│  └──────────────────┬───────────────────────────┘  └────────────────┘      │
+│                     │                                                       │
+└─────────────────────┼───────────────────────────────────────────────────────┘
+                      │
+                      │  PHASE 4: AGENT EXECUTION
+                      │
+                      │  main.py → agent_task.py:
+                      │
+                      │  11. get_gateway_access_token()
+                      │      → @requires_access_token(auth_flow="M2M")
+                      │      → reads WAT from implicit context
+                      │      → AgentCore Identity returns service token
+                      │
+                      │  12. MemoryHook(actor_id="alice", session_id=...)
+                      │      → uses EXPLICIT actor_id for per-user memory
+                      │
+                      │  13. Agent processes user message with LLM
+                      │      → LLM decides to call a tool
+                      │
+                      ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  PHASE 5: TOOL CALLS @requires_access_token                                 │
+│                                                                             │
+│  google.py — get_google_access_token():                                     │
+│                                                                             │
+│  @requires_access_token(                                                    │
+│      provider_name="acme-google-calendar",                                  │
+│      scopes=["...calendar"],                                                │
+│      auth_flow="USER_FEDERATION",  ← 3-Legged OAuth                        │
+│      on_auth_url=on_auth_url,                                               │
+│  )                                                                          │
+│  def get_google_access_token(access_token: str):                            │
+│      return access_token                                                    │
+│                                                                             │
+│  ┌─────────────────────────────────────────────────────┐                    │
+│  │  Inside the decorator (SDK internals):               │                    │
+│  │                                                      │                    │
+│  │  14. Read WAT from runtime context                   │                    │
+│  │      (WAT contains agent identity + user identity)   │                    │
+│  │                                                      │                    │
+│  │  15. Call AgentCore Identity:                         │                    │
+│  │      "Give me a Google Calendar token for             │                    │
+│  │       (this agent, this user, these scopes)"          │                    │
+│  │                                                      │                    │
+│  │  16a. Token found in vault?                          │                    │
+│  │       → Return it → injected as access_token param   │                    │
+│  │                                                      │                    │
+│  │  16b. No token? (first time for this user+resource)  │                    │
+│  │       → AgentCore Identity returns an auth URL        │                    │
+│  │       → Decorator calls on_auth_url(url)              │                    │
+│  │       → Webapp shows URL to user                      │                    │
+│  │       → User consents in browser                      │                    │
+│  │       → Callback server calls                         │                    │
+│  │         complete_resource_token_auth()                 │                    │
+│  │       → Token stored in vault per (agent, user,       │                    │
+│  │         provider, scopes)                              │                    │
+│  │       → On retry, token is found and injected          │                    │
+│  └──────────────────────────────────────────────────────┘                    │
+│                                                                             │
+│  17. Tool uses the injected access_token to call                            │
+│      Google Calendar API → returns Alice's events                           │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### 7.3 Why `@requires_access_token` Doesn't Need a `user_id` Parameter
+
+Looking at the decorator signature:
+
+```python
+@requires_access_token(
+    provider_name: str,           # Which OAuth provider (e.g., "google-cal-provider")
+    scopes: List[str],            # OAuth scopes needed
+    auth_flow: "M2M" | "USER_FEDERATION",
+    on_auth_url: Callable,        # Callback when user consent is needed
+    into: str = "access_token",   # Parameter name to inject token into
+    force_authentication: bool,
+    callback_url: str,            # OAuth redirect URI
+)
+```
+
+There is no `user_id` parameter. The user's identity is already embedded in the **Workload Access Token (WAT)** that the AgentCore Runtime created during Phase 3 (step 8). The SDK stores this WAT in an internal runtime context that the decorator reads automatically. This is by design:
+
+- **Separation of concerns**: Authentication (proving identity) is handled at the Runtime level during request processing. Tool code doesn't need to thread user IDs through every function call.
+- **Security**: The user identity comes from a cryptographically validated JWT → WAT chain, not from an easily-spoofable function parameter.
+- **Simplicity**: Tool developers only need to declare *what resource* they need (`provider_name`, `scopes`) and *what type of access* (`auth_flow`). The decorator handles the rest.
+
+### 7.4 The `actor_id` vs. WAT Distinction
+
+| | `actor_id` (Explicit) | Workload Access Token (Implicit) |
+|---|---|---|
+| **Source** | Extracted from JWT claims in webapp code | Created by Runtime via token exchange |
+| **Passed via** | HTTP payload → function parameters | SDK runtime context (automatic) |
+| **Contains** | A string identifier (e.g., `"alice"`) | Cryptographic proof of agent + user identity |
+| **Used by** | Memory (per-user history), app logic | `@requires_access_token` (token vault lookups) |
+| **Security model** | Application-level (trusts the webapp) | Zero-trust (validated by AgentCore Identity) |
+
+Both carry the user's identity, but through different mechanisms for different purposes. The `actor_id` is a convenience for application-level features like memory namespacing. The WAT is a security primitive that enables the decorator to request per-user tokens without the developer explicitly passing user identity.
+
+### 7.5 Code References
+
+The complete flow can be traced through the [customer-support-assistant](../02-use-cases/customer-support-assistant/) sample:
+
+| Step | File | Key Code |
+|------|------|----------|
+| User login (PKCE) | `app_modules/auth.py` | `AuthManager.handle_oauth_callback()` — exchanges auth code for JWT tokens |
+| Extract user claims | `app_modules/auth.py` | `get_user_claims()` — decodes `id_token` to get `cognito:username` |
+| Build invocation request | `app_modules/chat.py` | `invoke_endpoint()` — sends Bearer token + `actor_id` in payload |
+| Runtime entrypoint | `main.py` | `invoke(payload, context)` — extracts `actor_id` and `session_id` |
+| M2M token for Gateway | `agent_config/access_token.py` | `@requires_access_token(auth_flow="M2M")` — gets service token |
+| Memory with user scope | `agent_config/agent_task.py` | `MemoryHook(actor_id=actor_id)` — per-user conversation history |
+| User-delegated Google token | `agent_config/tools/google.py` | `@requires_access_token(auth_flow="USER_FEDERATION")` — gets Alice's Google token |
+
+### 7.6 FAQ: Who Sends the `session_id`? When Is It Created vs. Reused?
+
+**The webapp creates and manages the session ID — not the browser directly and not AgentCore Runtime.**
+
+In the customer-support-assistant sample, the Streamlit webapp generates a fresh UUID on first page load and stores it in Streamlit's session state:
+
+```python
+# app_modules/chat.py — _init_session_state()
+if "session_id" not in st.session_state:
+    st.session_state["session_id"] = str(uuid.uuid4())   # ← New UUID per browser tab
+```
+
+Every subsequent message in the same browser tab reuses this value, which is sent as a header:
+
+```python
+# app_modules/chat.py — invoke_endpoint()
+headers = {
+    "Authorization": f"Bearer {bearer_token}",
+    "X-Amzn-Bedrock-AgentCore-Runtime-Session-Id": session_id,   # ← Same UUID throughout
+}
+```
+
+| Event | What happens to `session_id` |
+|-------|------------------------------|
+| **User opens a new browser tab** | Webapp generates a fresh `uuid.uuid4()` → new session |
+| **User sends another message in the same tab** | Webapp reuses `st.session_state["session_id"]` → same container |
+| **Container times out** (15-min idle / 8-hr max) | Next request with the same `session_id` creates a new container — all in-memory state is lost, but AgentCore Memory persists |
+| **User refreshes the page** (Streamlit) | `st.session_state` resets → new UUID → new session |
+
+**Key point**: The `session_id` is opaque to AgentCore — the platform does no user-binding validation. Whoever sends the same session ID header is routed to the same container. It is the **webapp's responsibility** to generate unique, per-user session IDs (which the sample does via `uuid.uuid4()`).
+
+For a deeper treatment of session lifecycle, see [session-lifecycle.md](./session-lifecycle.md).
+
+### 7.7 FAQ: What If `actor_id` Is Missing or Wrong?
+
+> **⚠️ SECURITY NOTE**: The `actor_id` is an application-level string with **no platform validation**. AgentCore does not verify that `actor_id` matches the authenticated user's JWT. If your webapp passes the wrong `actor_id`, the agent will read and write **another user's memory** — with no error or warning. Always extract `actor_id` from the validated JWT claims; never accept it from client/browser input.
+
+#### If `actor_id` is missing from the request body
+
+The agent entrypoint crashes with a `KeyError`:
+
+```python
+# main.py — invoke()
+actor_id = payload["actor_id"]   # ← KeyError if key is absent
+```
+
+There is no graceful fallback — this is a hard crash. A production webapp should always extract `actor_id` from the validated JWT claims before calling `/invocations`.
+
+#### If `actor_id` is wrong (e.g., `"bob"` instead of `"alice"`)
+
+**Yes — the agent will retrieve and write to the wrong user's memory.** There is no platform-level validation that `actor_id` matches the authenticated user's JWT.
+
+Memory is namespaced by `actor_id` via direct string interpolation:
+
+```python
+# agent_config/memory_hook_provider.py
+namespace=f"support/user/{self.actor_id}/preferences"   # ← Whatever string was passed
+namespace=f"support/user/{self.actor_id}/facts"
+```
+
+And conversation history is scoped by the `(memory_id, actor_id, session_id)` tuple:
+
+```python
+# agent_config/memory_hook_provider.py — on_agent_initialized()
+recent_turns = self.memory_client.get_last_k_turns(
+    memory_id=self.memory_id,
+    actor_id=self.actor_id,      # ← Any string — no validation
+    session_id=self.session_id,
+    k=5,
+)
+```
+
+If the webapp has a bug and sends `"actor_id": "bob"` with Alice's valid JWT:
+1. ✅ Alice's JWT is validated (she's authorized to call the agent)
+2. ❌ The agent loads **Bob's** conversation history, preferences, and facts
+3. ❌ Alice's conversation is saved **under Bob's** namespace
+4. → **Cross-user memory contamination and disclosure**
+
+#### Why the current sample is safe *in practice*
+
+The webapp extracts `actor_id` directly from the validated JWT — never from user input:
+
+```python
+# app_modules/chat.py
+payload = json.dumps({
+    "prompt": prompt,
+    "actor_id": user_claims.get("cognito:username")   # ← From decoded id_token
+})
+```
+
+A bug would have to be introduced in this webapp code path to send the wrong value.
+
+#### Why `@requires_access_token` is NOT affected
+
+The `@requires_access_token` decorator uses the **implicit** identity channel (Workload Access Token), not the explicit `actor_id`. Even if `actor_id` is wrong, the WAT still carries the real user's cryptographically validated identity. So tool access (e.g., Google Calendar) always resolves to the correct user — only **Memory** is affected by a wrong `actor_id`.
+
+| Concern | `actor_id` (Explicit) | WAT (Implicit) |
+|---------|----------------------|----------------|
+| Can a webapp bug cause cross-user access? | ⚠️ **Yes** — Memory reads/writes use the string as-is | ✅ **No** — cryptographically bound to the validated JWT |
+| Platform validates it? | ❌ No | ✅ Yes (JWT → token exchange → WAT) |
+| Mitigation | Webapp must extract from JWT; never accept from client input | Built-in — no developer action needed |
+
+## 8. Streaming & Async Responses
 
 Agents support streaming by yielding events from the entrypoint:
 
@@ -560,7 +851,7 @@ async def invoke(payload, context):
             yield event["data"]
 ```
 
-## 8. Key Takeaway
+## 9. Key Takeaway
 
 | Layer | Protocol | Standard? |
 |---|---|---|
