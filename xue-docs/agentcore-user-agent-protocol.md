@@ -771,6 +771,8 @@ For a deeper treatment of session lifecycle, see [session-lifecycle.md](./sessio
 
 ### 7.7 FAQ: What If `actor_id` Is Missing or Wrong?
 
+> **⚠️ SECURITY NOTE**: The `actor_id` is an application-level string with **no platform validation**. AgentCore does not verify that `actor_id` matches the authenticated user's JWT. If your webapp passes the wrong `actor_id`, the agent will read and write **another user's memory** — with no error or warning. Always extract `actor_id` from the validated JWT claims; never accept it from client/browser input.
+
 #### If `actor_id` is missing from the request body
 
 The agent entrypoint crashes with a `KeyError`:
