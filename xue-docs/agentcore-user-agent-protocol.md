@@ -421,7 +421,7 @@ When the agent uses tools through **AgentCore Gateway** (instead of calling the 
 
 1. **User makes request**: *"Get my LinkedIn profile."*
 2. **Agent sends MCP `tools/call`**: The agent calls the Gateway MCP endpoint with an inbound JWT as the `Authorization: Bearer` header. This JWT is validated by the Gateway's configured authorizer (e.g., Cognito CUSTOM_JWT). The Gateway extracts the caller's identity from the JWT claims. The agent does **not** use `@requires_access_token` — the Gateway handles outbound auth entirely.
-3. **Gateway detects no token**: The Gateway checks the AgentCore Identity token vault for this (credential provider, user, scope) combination. No token found → Gateway returns an **MCP Elicitation Response** containing an OAuth authorization URL. The MCP client (or webapp) opens this URL in the user's browser.
+3. **Gateway detects no token**: The Gateway checks the AgentCore Identity token vault for this (credential provider, user identity, scope) combination. No token found → Gateway returns an **MCP Elicitation Response** containing an OAuth authorization URL. The MCP client (or webapp) opens this URL in the user's browser.
 4. **User is redirected to OAuth provider**: Browser navigates to the provider's (e.g., LinkedIn) consent screen.
 5. **User grants consent**: Clicks "Allow" on the provider's permission prompt.
 6. **OAuth provider redirects to callback**: Browser redirects to the developer's callback server with a `session_id`.
