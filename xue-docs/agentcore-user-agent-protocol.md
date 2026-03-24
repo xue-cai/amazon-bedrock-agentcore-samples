@@ -365,6 +365,86 @@ Every call follows the same path. No user interaction is ever needed. The decora
 7. **Tokens stored in vault**: Per-user, encrypted. Each (agent, user, provider, scope) tuple gets its own token pair.
 8. **Agent retries with token**: `@requires_access_token` now finds the token in the vault and injects it as the `access_token` parameter.
 
+#### USER_FEDERATION via Gateway (Auth Code Grant through MCP Elicitation)
+
+When the agent uses tools through **AgentCore Gateway** (instead of calling the external API directly), the Gateway itself manages the outbound OAuth flow. The agent no longer uses `@requires_access_token` — instead, the Gateway handles credential acquisition, storage, and injection transparently.
+
+```
+                                         ┌─────────────────┐
+                                         │  OAuth Provider  │
+                                         │ (e.g., LinkedIn) │
+                                         └────┬───────▲─────┘
+                                       5. User│       │4. Redirect
+                                       grants │       │   to provider
+                                       consent│       │
+                                         ┌────▼───────┴─────┐
+                                         │  User's Browser   │
+                                         └────┬───────▲─────┘
+                                       6. Provider    │3. MCP Client opens
+                                       redirects     │   elicitation URL
+                                       to callback   │   in user's browser
+                                         ┌────▼───────┴─────┐
+  1. "Get my        ┌──────────┐         │  Callback Server  │
+     LinkedIn ────▶│  Webapp   │         │  (/oauth2/callback)│
+     profile"      │(Streamlit)│         └────────┬──────────┘
+                   └────┬──────┘                  │7. complete_resource_token_auth()
+                        │                         ▼
+                        │ POST           ┌─────────────────────┐
+                        │/invocations    │ AgentCore Identity   │
+                        ▼                │ Service (Token Vault)│
+                   ┌──────────────┐      └────────┬────────────┘
+                   │ AgentCore    │               │8. Tokens stored
+                   │ Runtime      │               │   per-user,
+                   │ (your agent) │               │   encrypted
+                   └──────┬───────┘               │
+                          │                       │
+                          │ 2. MCP tools/call      │
+                          │    (Bearer token from  │
+                          │     inbound auth)      │
+                          ▼                       │
+                   ┌──────────────────┐           │
+                   │ AgentCore        │◄──────────┘
+                   │ Gateway          │  9. Gateway retrieves
+                   │ (MCP Server)     │     user's access token
+                   └──────┬───────────┘     from Identity vault
+                          │
+                          │ 10. Gateway injects token
+                          │     into outbound API call
+                          ▼
+                   ┌──────────────┐
+                   │ LinkedIn     │
+                   │ API          │
+                   └──────────────┘
+```
+
+**Step-by-step (USER_FEDERATION via Gateway):**
+
+1. **User makes request**: *"Get my LinkedIn profile."*
+2. **Agent sends MCP `tools/call`**: The agent calls the Gateway MCP endpoint with the user's inbound JWT (from Cognito) as the `Authorization: Bearer` header. The agent does **not** use `@requires_access_token` — the Gateway handles outbound auth.
+3. **Gateway detects no token**: The Gateway checks the AgentCore Identity token vault for this user + provider + scope. No token found → Gateway returns an **MCP Elicitation Response** containing an OAuth authorization URL. The MCP client (or webapp) opens this URL in the user's browser.
+4. **User is redirected to OAuth provider**: Browser navigates to the provider's (e.g., LinkedIn) consent screen.
+5. **User grants consent**: Clicks "Allow" on the provider's permission prompt.
+6. **OAuth provider redirects to callback**: Browser redirects to the developer's callback server with a `session_id`.
+7. **Callback server completes the flow**: Calls `complete_resource_token_auth()` — tells AgentCore Identity to exchange the authorization code for access + refresh tokens.
+8. **Tokens stored in vault**: Per-user, encrypted. Each (gateway, user, provider, scope) tuple gets its own token pair. **AgentCore Identity** stores and manages both the access token and the refresh token.
+9. **Agent retries the MCP `tools/call`**: The Gateway now finds the user's token in the Identity vault and retrieves it.
+10. **Gateway injects token into outbound API call**: The Gateway translates the MCP request into an HTTP API call to LinkedIn, injecting the user's access token as a `Bearer` header. The agent never sees or handles the external access token.
+
+**Key differences from the direct (non-Gateway) flow:**
+
+| Aspect | Direct (agent calls API) | Via Gateway |
+|---|---|---|
+| **Who acquires tokens?** | Agent code via `@requires_access_token` decorator triggers the OAuth flow | **Gateway** triggers the OAuth flow; returns MCP Elicitation Response to signal consent is needed |
+| **Who stores tokens?** | **AgentCore Identity** Token Vault (per-user, encrypted) | **AgentCore Identity** Token Vault (per-user, encrypted) — same vault |
+| **Who refreshes tokens?** | **AgentCore Identity** via the decorator (automatic, silent) | **AgentCore Identity** on behalf of the Gateway (automatic, silent) |
+| **Does the agent see the external token?** | Yes — injected as `access_token` parameter | **No** — Gateway injects it into the outbound call; agent only sees MCP responses |
+| **Callback server needed?** | Yes — developer-deployed | Yes — developer-deployed (same pattern) |
+| **Consent mechanism** | `on_auth_url` callback in decorator | MCP Elicitation Response (URL mode, per MCP 2025-11-25 spec) |
+| **Credential provider config** | In `@requires_access_token` decorator parameters | In Gateway Target configuration (`credentialProviderConfigurations`) |
+| **Where is provider registered?** | AgentCore Identity (credential provider) + Workload Identity | AgentCore Identity (credential provider) + Gateway Target |
+
+> **Why use Gateway for USER_FEDERATION?** The Gateway approach decouples your agent code from OAuth complexity entirely. The agent only speaks MCP — it never handles tokens, refresh logic, or OAuth URLs. The Gateway and Identity service collaborate to handle the full token lifecycle, while the MCP Elicitation protocol (introduced in MCP spec 2025-11-25) provides a standardized way to signal that user consent is needed.
+
 ### 5.4 Credentials, Tokens & Lifecycle
 
 This table compares every credential and token involved — where it comes from, where it's stored, who caches it, and who refreshes it.
