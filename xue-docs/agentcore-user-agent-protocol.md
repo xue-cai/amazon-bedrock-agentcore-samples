@@ -465,6 +465,53 @@ Agent B ──MCP──▶ Gateway Target "LinkedIn" ──┘     (provider X, 
 
 This is intentional: the Gateway acts as a shared infrastructure layer. Users consent to the *Gateway target's* access (a specific provider + scope combination), not to each individual agent that routes through it.
 
+#### What If You Need Per-Agent User Consent?
+
+**Scenario**: Alice wants Agent A to access her Google Calendar, but does **not** want Agent B to have that access — even though both agents route through the same Gateway.
+
+The Gateway token-sharing model does **not** support this at the token vault level. Once Alice consents via the Gateway's LinkedIn target, any agent that can reach that Gateway target inherits her consent. So where does the access control live?
+
+**The control point is the inbound authorization layer, not the token vault.**
+
+The Gateway's `CUSTOM_JWT` authorizer + Cognito scopes determine which agents can call which Gateway targets *before* the token vault is ever consulted:
+
+```
+                                     ┌──────────────────────────────┐
+Agent A (Cognito client A)           │  Gateway                     │
+  JWT scopes: ["calendar-target"]    │                              │
+  ─────────────────────────────────▶ │  1. Validate JWT ✅          │
+                                     │  2. Check scope matches      │
+                                     │     target ✅                │
+                                     │  3. Retrieve/inject token    │
+                                     │                              │
+Agent B (Cognito client B)           │                              │
+  JWT scopes: [] (no calendar scope) │                              │
+  ─────────────────────────────────▶ │  1. Validate JWT ✅          │
+                                     │  2. Check scope matches      │
+                                     │     target ❌ → 403 Forbidden│
+                                     └──────────────────────────────┘
+```
+
+The [Gateway tutorial](../01-tutorials/02-AgentCore-gateway/13-outbound-auth-code-grant/01-outbound-auth-code-grant-linkedin.ipynb) shows this pattern: each Gateway target gets a Cognito **resource server scope** (e.g., `agentcore-gateway-id/LinkedInAuthCode`). An agent's Cognito app client must be granted that scope to obtain a JWT the Gateway will accept for that target. The Gateway operator (developer/admin) controls which app clients get which scopes.
+
+**But this is operator-level control, not end-user control.** The user doesn't get to choose "Agent A yes, Agent B no" at consent time — the operator decides which agents can reach which targets. If the operator grants both Agent A and Agent B the scope for the calendar target, both get access once Alice consents.
+
+**When to use which model:**
+
+| Requirement | Recommended approach |
+|---|---|
+| **Operator controls which agents access which APIs** (most common) | Gateway flow — use Cognito scopes to gate which agents can reach which targets. Token sharing is a feature (one user consent covers all authorized agents). |
+| **Users must consent per-agent** (e.g., "I trust Agent A but not Agent B with my calendar") | **Direct flow** (`@requires_access_token` + WAT). Vault key includes agent identity → separate tokens per agent → separate user consent per agent. |
+| **Mixed**: some APIs are shared infrastructure, others need per-agent consent | Use Gateway for shared APIs (e.g., company directory lookup). Use direct flow for sensitive per-user APIs (e.g., personal calendar, email). |
+
+**Mitigation strategies if you must use Gateway but want isolation:**
+
+1. **Separate Gateway targets with separate credential providers**: Create `Calendar-for-AgentA` and `Calendar-for-AgentB` targets, each with its own credential provider pointing to Google Calendar. Different credential providers → different vault keys → separate tokens → separate user consent. But this duplicates configuration.
+2. **Separate Gateways entirely**: If Agent A and Agent B serve different trust domains, deploy separate Gateways. Each Gateway has its own IAM role and targets.
+3. **Cognito scope-based exclusion**: Don't grant Agent B's Cognito app client the scope for the calendar target. Agent B physically cannot call that target — the Gateway rejects the JWT at the inbound auth layer.
+
+> **Rule of thumb**: If the user's relationship with each agent matters for authorization (e.g., personal assistants with varying trust levels), prefer the direct flow. If the Gateway is shared infrastructure controlled by a single operator (e.g., a company's API gateway), the Gateway token-sharing model is appropriate.
+
 #### How Does the Gateway Identify the User?
 
 The Gateway does **not** use the Workload Access Token (WAT) mechanism that the Runtime + SDK use. The two paths differ:
