@@ -357,12 +357,12 @@ Every call follows the same path. No user interaction is ever needed. The decora
 **Step-by-step (USER_FEDERATION only — M2M skips all of this):**
 
 1. **User makes request**: *"Check my calendar for today."*
-2. **Agent detects no token**: `@requires_access_token` checks the token vault for this (user, resource, scope) tuple. No token → generates an OAuth authorization URL → calls `on_auth_url` callback so the webapp can show it to the user.
+2. **Agent detects no token**: `@requires_access_token` checks the token vault for this (agent identity, user identity, credential provider, scope) tuple — where the agent identity and user identity are both encoded in the WAT. No token → generates an OAuth authorization URL → calls `on_auth_url` callback so the webapp can show it to the user.
 3. **User is redirected to OAuth provider**: Browser opens Google/GitHub consent screen.
 4. **User grants consent**: Clicks "Allow" on the provider's permission prompt.
 5. **OAuth provider redirects to callback**: Browser redirects to your callback server with a `session_id`.
 6. **Callback server completes the flow**: Calls `complete_resource_token_auth()` — tells AgentCore Identity to exchange the authorization code for access + refresh tokens.
-7. **Tokens stored in vault**: Per-user, encrypted. Each (agent, user, provider, scope) tuple gets its own token pair.
+7. **Tokens stored in vault**: Per-user, encrypted. Each **(agent identity, user identity, credential provider, scope)** tuple gets its own token pair — the agent identity comes from the WAT.
 8. **Agent retries with token**: `@requires_access_token` now finds the token in the vault and injects it as the `access_token` parameter.
 
 #### USER_FEDERATION via Gateway (Auth Code Grant through MCP Elicitation)
@@ -435,7 +435,7 @@ When the agent uses tools through **AgentCore Gateway** (instead of calling the 
 | Aspect | Direct (agent calls API) | Via Gateway |
 |---|---|---|
 | **Who acquires tokens?** | Agent code via `@requires_access_token` decorator triggers the OAuth flow | **Gateway** triggers the OAuth flow; returns MCP Elicitation Response to signal consent is needed |
-| **Who stores tokens?** | **AgentCore Identity** Token Vault — keyed by (agent, user, provider, scope) | **AgentCore Identity** Token Vault — keyed by (credential provider, user, scope). Tokens are shared across agents using the same Gateway target (see below) |
+| **Who stores tokens?** | **AgentCore Identity** Token Vault — keyed by (agent identity, user identity, credential provider, scope). Each agent gets its own token pair per user. | **AgentCore Identity** Token Vault — keyed by (credential provider, user identity, scope). No agent identity in the key — tokens are shared across agents using the same Gateway target (see below) |
 | **Who refreshes tokens?** | **AgentCore Identity** via the decorator (automatic, silent) | **AgentCore Identity** on behalf of the Gateway (automatic, silent) |
 | **How is the user identified?** | Runtime exchanges inbound JWT → **WAT** (encodes agent + user identity); decorator reads WAT from SDK context | Gateway validates inbound JWT via its authorizer, extracts user identity from JWT claims; uses its **IAM role** to call Identity APIs |
 | **Does the agent see the external token?** | Yes — injected as `access_token` parameter | **No** — Gateway injects it into the outbound call; agent only sees MCP responses |
