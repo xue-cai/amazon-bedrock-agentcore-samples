@@ -357,13 +357,185 @@ Every call follows the same path. No user interaction is ever needed. The decora
 **Step-by-step (USER_FEDERATION only — M2M skips all of this):**
 
 1. **User makes request**: *"Check my calendar for today."*
-2. **Agent detects no token**: `@requires_access_token` checks the token vault for this (user, resource, scope) tuple. No token → generates an OAuth authorization URL → calls `on_auth_url` callback so the webapp can show it to the user.
+2. **Agent detects no token**: `@requires_access_token` checks the token vault for this (agent identity, user identity, credential provider, scope) tuple — where the agent identity and user identity are both encoded in the WAT. No token → generates an OAuth authorization URL → calls `on_auth_url` callback so the webapp can show it to the user.
 3. **User is redirected to OAuth provider**: Browser opens Google/GitHub consent screen.
 4. **User grants consent**: Clicks "Allow" on the provider's permission prompt.
 5. **OAuth provider redirects to callback**: Browser redirects to your callback server with a `session_id`.
 6. **Callback server completes the flow**: Calls `complete_resource_token_auth()` — tells AgentCore Identity to exchange the authorization code for access + refresh tokens.
-7. **Tokens stored in vault**: Per-user, encrypted. Each (agent, user, provider, scope) tuple gets its own token pair.
+7. **Tokens stored in vault**: Per-user, encrypted. Each **(agent identity, user identity, credential provider, scope)** tuple gets its own token pair — the agent identity comes from the WAT.
 8. **Agent retries with token**: `@requires_access_token` now finds the token in the vault and injects it as the `access_token` parameter.
+
+#### USER_FEDERATION via Gateway (Auth Code Grant through MCP Elicitation)
+
+When the agent uses tools through **AgentCore Gateway** (instead of calling the external API directly), the Gateway itself manages the outbound OAuth flow. The agent no longer uses `@requires_access_token` — instead, the Gateway handles credential acquisition, storage, and injection transparently.
+
+```
+                                         ┌─────────────────┐
+                                         │  OAuth Provider  │
+                                         │ (e.g., LinkedIn) │
+                                         └────┬───────▲─────┘
+                                       5. User│       │4. Redirect
+                                       grants │       │   to provider
+                                       consent│       │
+                                         ┌────▼───────┴─────┐
+                                         │  User's Browser   │
+                                         └────┬───────▲─────┘
+                                       6. Provider    │3. MCP Client opens
+                                       redirects     │   elicitation URL
+                                       to callback   │   in user's browser
+                                         ┌────▼───────┴─────┐
+  1. "Get my        ┌──────────┐         │  Callback Server  │
+     LinkedIn ────▶│  Webapp   │         │  (/oauth2/callback)│
+     profile"      │(Streamlit)│         └────────┬──────────┘
+                   └────┬──────┘                  │7. complete_resource_token_auth()
+                        │                         ▼
+                        │ POST           ┌─────────────────────┐
+                        │/invocations    │ AgentCore Identity   │
+                        ▼                │ Service (Token Vault)│
+                   ┌──────────────┐      └────────┬────────────┘
+                   │ AgentCore    │               │8. Tokens stored;
+                   │ Runtime      │               │   vault key:
+                   │ (your agent) │               │   (cred_provider,
+                   └──────┬───────┘               │    user, scope)
+                          │                       │
+                          │ 2. MCP tools/call      │
+                          │    (Bearer token from  │
+                          │     inbound auth)      │
+                          ▼                       │
+                   ┌──────────────────┐           │
+                   │ AgentCore        │◄──────────┘
+                   │ Gateway          │  9. Gateway uses IAM role
+                   │ (MCP Server)     │     + user identity from JWT
+                   └──────┬───────────┘     to retrieve token from vault
+                          │
+                          │ 10. Gateway injects token
+                          │     into outbound API call
+                          ▼
+                   ┌──────────────┐
+                   │ LinkedIn     │
+                   │ API          │
+                   └──────────────┘
+```
+
+**Step-by-step (USER_FEDERATION via Gateway):**
+
+1. **User makes request**: *"Get my LinkedIn profile."*
+2. **Agent sends MCP `tools/call`**: The agent calls the Gateway MCP endpoint with an inbound JWT as the `Authorization: Bearer` header. This JWT is validated by the Gateway's configured authorizer (e.g., Cognito CUSTOM_JWT). The Gateway extracts the caller's identity from the JWT claims. The agent does **not** use `@requires_access_token` — the Gateway handles outbound auth entirely.
+3. **Gateway detects no token**: The Gateway checks the AgentCore Identity token vault for this (credential provider, user identity, scope) combination. No token found → Gateway returns an **MCP Elicitation Response** containing an OAuth authorization URL. The MCP client (or webapp) opens this URL in the user's browser.
+4. **User is redirected to OAuth provider**: Browser navigates to the provider's (e.g., LinkedIn) consent screen.
+5. **User grants consent**: Clicks "Allow" on the provider's permission prompt.
+6. **OAuth provider redirects to callback**: Browser redirects to the developer's callback server with a `session_id`.
+7. **Callback server completes the flow**: Calls `complete_resource_token_auth()` — tells AgentCore Identity to exchange the authorization code for access + refresh tokens.
+8. **Tokens stored in vault**: Per-user, encrypted. The vault key is **(credential provider, user identity, scope)** — not per-agent or per-gateway. **AgentCore Identity** stores and manages both the access token and the refresh token. See [Token Sharing Across Agents](#token-sharing-across-agents) below.
+9. **Agent retries the MCP `tools/call`**: The Gateway uses its own **IAM role** to call AgentCore Identity APIs, presenting the user identity extracted from the inbound JWT. Identity returns the stored access token. See [How Does the Gateway Identify the User?](#how-does-the-gateway-identify-the-user) below.
+10. **Gateway injects token into outbound API call**: The Gateway translates the MCP request into an HTTP API call to LinkedIn, injecting the user's access token as a `Bearer` header. The agent never sees or handles the external access token.
+
+**Key differences from the direct (non-Gateway) flow:**
+
+| Aspect | Direct (agent calls API) | Via Gateway |
+|---|---|---|
+| **Who acquires tokens?** | Agent code via `@requires_access_token` decorator triggers the OAuth flow | **Gateway** triggers the OAuth flow; returns MCP Elicitation Response to signal consent is needed |
+| **Who stores tokens?** | **AgentCore Identity** Token Vault — keyed by (agent identity, user identity, credential provider, scope). Each agent gets its own token pair per user. | **AgentCore Identity** Token Vault — keyed by (credential provider, user identity, scope). No agent identity in the key — tokens are shared across agents using the same Gateway target (see below) |
+| **Who refreshes tokens?** | **AgentCore Identity** via the decorator (automatic, silent) | **AgentCore Identity** on behalf of the Gateway (automatic, silent) |
+| **How is the user identified?** | Runtime exchanges inbound JWT → **WAT** (encodes agent + user identity); decorator reads WAT from SDK context | Gateway validates inbound JWT via its authorizer, extracts user identity from JWT claims; uses its **IAM role** to call Identity APIs |
+| **Does the agent see the external token?** | Yes — injected as `access_token` parameter | **No** — Gateway injects it into the outbound call; agent only sees MCP responses |
+| **Callback server needed?** | Yes — developer-deployed | Yes — developer-deployed (same pattern) |
+| **Consent mechanism** | `on_auth_url` callback in decorator | MCP Elicitation Response (URL mode, per MCP 2025-11-25 spec) |
+| **Credential provider config** | In `@requires_access_token` decorator parameters | In Gateway Target configuration (`credentialProviderConfigurations`) |
+| **Where is provider registered?** | AgentCore Identity (credential provider) + Workload Identity | AgentCore Identity (credential provider) + Gateway Target |
+
+> **Why use Gateway for USER_FEDERATION?** The Gateway approach decouples your agent code from OAuth complexity entirely. The agent only speaks MCP — it never handles tokens, refresh logic, or OAuth URLs. The Gateway and Identity service collaborate to handle the full token lifecycle, while the MCP Elicitation protocol (introduced in MCP spec 2025-11-25) provides a standardized way to signal that user consent is needed.
+
+#### Token Sharing Across Agents
+
+In the **direct** (non-Gateway) flow, tokens in the Identity vault are keyed by **(agent identity, user identity, credential provider, scope)**. Each agent has its own WAT, so Agent A and Agent B calling the same Google Calendar API for the same user get *separate* token pairs — the user must consent once per agent.
+
+In the **Gateway** flow, the vault key is **(credential provider, user identity, scope)**. The credential provider is configured on the Gateway Target, not on the individual agent. This means:
+
+- **Yes — different agents that call the same Gateway target share the same access/refresh tokens for a given user.** If Agent A triggers user consent for LinkedIn via the Gateway, Agent B calling the same Gateway target for the same user will find the token already in the vault — no second consent needed.
+- The sharing boundary is the **Gateway Target** + **credential provider configuration**. If you create two Gateway targets pointing to the same LinkedIn API but with different credential providers, they would NOT share tokens.
+
+```
+Agent A ──MCP──▶ Gateway Target "LinkedIn" ──┐
+                  (credential provider: X)     ├──▶ Identity Vault key:
+Agent B ──MCP──▶ Gateway Target "LinkedIn" ──┘     (provider X, user Alice, scope "profile")
+                  (same credential provider: X)
+                                               → Same token pair. One consent.
+```
+
+This is intentional: the Gateway acts as a shared infrastructure layer. Users consent to the *Gateway target's* access (a specific provider + scope combination), not to each individual agent that routes through it.
+
+#### What If You Need Per-Agent User Consent?
+
+**Scenario**: Alice wants Agent A to access her Google Calendar, but does **not** want Agent B to have that access — even though both agents route through the same Gateway.
+
+The Gateway token-sharing model does **not** support this at the token vault level. Once Alice consents via the Gateway's LinkedIn target, any agent that can reach that Gateway target inherits her consent. So where does the access control live?
+
+**The control point is the inbound authorization layer, not the token vault.**
+
+The Gateway's `CUSTOM_JWT` authorizer + Cognito scopes determine which agents can call which Gateway targets *before* the token vault is ever consulted:
+
+```
+                                     ┌──────────────────────────────┐
+Agent A (Cognito client A)           │  Gateway                     │
+  JWT scopes: ["calendar-target"]    │                              │
+  ─────────────────────────────────▶ │  1. Validate JWT ✅          │
+                                     │  2. Check scope matches      │
+                                     │     target ✅                │
+                                     │  3. Retrieve/inject token    │
+                                     │                              │
+Agent B (Cognito client B)           │                              │
+  JWT scopes: [] (no calendar scope) │                              │
+  ─────────────────────────────────▶ │  1. Validate JWT ✅          │
+                                     │  2. Check scope matches      │
+                                     │     target ❌ → 403 Forbidden│
+                                     └──────────────────────────────┘
+```
+
+The [Gateway tutorial](../01-tutorials/02-AgentCore-gateway/13-outbound-auth-code-grant/01-outbound-auth-code-grant-linkedin.ipynb) shows this pattern: each Gateway target gets a Cognito **resource server scope** (e.g., `agentcore-gateway-id/LinkedInAuthCode`). An agent's Cognito app client must be granted that scope to obtain a JWT the Gateway will accept for that target. The Gateway operator (developer/admin) controls which app clients get which scopes.
+
+**But this is operator-level control, not end-user control.** The user doesn't get to choose "Agent A yes, Agent B no" at consent time — the operator decides which agents can reach which targets. If the operator grants both Agent A and Agent B the scope for the calendar target, both get access once Alice consents.
+
+**When to use which model:**
+
+| Requirement | Recommended approach |
+|---|---|
+| **Operator controls which agents access which APIs** (most common) | Gateway flow — use Cognito scopes to gate which agents can reach which targets. Token sharing is a feature (one user consent covers all authorized agents). |
+| **Users must consent per-agent** (e.g., "I trust Agent A but not Agent B with my calendar") | **Direct flow** (`@requires_access_token` + WAT). Vault key includes agent identity → separate tokens per agent → separate user consent per agent. |
+| **Mixed**: some APIs are shared infrastructure, others need per-agent consent | Use Gateway for shared APIs (e.g., company directory lookup). Use direct flow for sensitive per-user APIs (e.g., personal calendar, email). |
+
+**Mitigation strategies if you must use Gateway but want isolation:**
+
+1. **Separate Gateway targets with separate credential providers**: Create `Calendar-for-AgentA` and `Calendar-for-AgentB` targets, each with its own credential provider pointing to Google Calendar. Different credential providers → different vault keys → separate tokens → separate user consent. But this duplicates configuration.
+2. **Separate Gateways entirely**: If Agent A and Agent B serve different trust domains, deploy separate Gateways. Each Gateway has its own IAM role and targets.
+3. **Cognito scope-based exclusion**: Don't grant Agent B's Cognito app client the scope for the calendar target. Agent B physically cannot call that target — the Gateway rejects the JWT at the inbound auth layer.
+
+> **Rule of thumb**: If the user's relationship with each agent matters for authorization (e.g., personal assistants with varying trust levels), prefer the direct flow. If the Gateway is shared infrastructure controlled by a single operator (e.g., a company's API gateway), the Gateway token-sharing model is appropriate.
+
+#### How Does the Gateway Identify the User?
+
+The Gateway does **not** use the Workload Access Token (WAT) mechanism that the Runtime + SDK use. The two paths differ:
+
+| | Runtime + SDK (direct flow) | Gateway flow |
+|---|---|---|
+| **Inbound auth** | Runtime validates inbound JWT (signature, issuer, audience) | Gateway validates inbound JWT via its configured authorizer (`CUSTOM_JWT`) |
+| **User identity extraction** | Runtime exchanges JWT → **WAT** via AgentCore Identity token exchange API. WAT encodes both agent identity and user identity. | Gateway extracts user identity directly from the **validated JWT claims** (e.g., `sub`, `client_id`). No WAT is created. |
+| **How tokens are retrieved** | `@requires_access_token` reads WAT from SDK runtime context → presents WAT to Identity API → Identity resolves (agent + user) and returns the resource token | Gateway uses its **IAM role** to call Identity APIs, passing the user identity from the JWT. Identity resolves (credential provider + user) and returns the resource token. |
+| **Authentication to Identity service** | Agent's workload identity (embedded in WAT) | Gateway's **IAM role** (the `roleArn` assigned when creating the Gateway) |
+
+In the Gateway flow, the chain of trust is:
+
+```
+Inbound JWT ──validated by──▶ Gateway Authorizer ──extracts──▶ User Identity
+                                                                    │
+Gateway IAM Role ──authenticates──▶ AgentCore Identity API ◄───────┘
+                                         │                  (user identity
+                                         ▼                   as parameter)
+                                   Token Vault lookup:
+                                   (credential_provider, user, scope)
+```
+
+The Gateway's IAM role is the credential that Identity trusts. The user identity from the validated JWT is the lookup key. Together, they replace the WAT's role of proving "this agent is authorized to act on behalf of this user." The difference is that the Gateway is a first-party AWS service with its own IAM role, so it authenticates to Identity via IAM rather than via a WAT.
 
 ### 5.4 Credentials, Tokens & Lifecycle
 
